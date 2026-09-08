@@ -1,0 +1,10 @@
+.env
+.venv/*
+
+_jobs/*
+_tmp/*
+
+__pycache__/
+*.py[cod]
+
+_tests/

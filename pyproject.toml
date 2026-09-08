@@ -1,0 +1,35 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "viton-service"
+version = "0.1.0"
+description = "Headless RabbitMQ GPU worker for ai-human generation and virtual try-on (thin-venv / conda delegation)."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "pydantic>=2.7",
+    "pydantic-settings>=2.4",
+    "aio-pika>=9.4",
+    "asyncpg>=0.29",
+    "nvidia-ml-py>=12.555",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/viton_api"]
+
+[tool.uv]
+package = true
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.23",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
