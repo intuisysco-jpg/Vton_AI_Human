@@ -73,6 +73,30 @@ class PostgresStore:
             job_id,
         )
 
+    async def mark_exec_started(self, job_id) -> None:
+        """Stamp the true execution start: right before the pipeline call.
+
+        ``mark_running`` fires before the GPU lease/settle gate, so
+        ``started_at`` includes GPU-queue wait; this is the moment execution
+        actually begins (same DB clock as ``started_at``). Plain SET — a
+        retried attempt overwrites the previous stamp.
+        """
+        await self.pool.execute(
+            "UPDATE jobs SET exec_started_at=now(), updated_at=now() WHERE id = $1",
+            job_id,
+        )
+
+    async def set_execution_ms(self, job_id, ms: int) -> None:
+        """Persist the worker-measured pipeline-call duration (monotonic ms).
+
+        Plain SET per attempt — last attempt wins, and callers write it even
+        when the attempt fails, is cancelled, or requeues on CUDA OOM.
+        """
+        await self.pool.execute(
+            "UPDATE jobs SET execution_ms=$2, updated_at=now() WHERE id = $1",
+            job_id, ms,
+        )
+
     async def set_stage_progress(self, job_id, stage: str, pct: int) -> None:
         await self.pool.execute(
             "UPDATE jobs SET current_stage=$2, progress=$3, updated_at=now() WHERE id = $1",

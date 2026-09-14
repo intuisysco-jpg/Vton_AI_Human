@@ -418,10 +418,16 @@ class JobProcessor:
             except TimeoutError:
                 logger.info("reference %s: GPU lease busy -> NACK_REQUEUE", reference)
                 return AckDecision.NACK_REQUEUE
+            exec_t0: float | None = None  # set once the gate passes; None = never started
             try:
                 gate = await self._await_gpu_free(job_id, reference, job_type)
                 if gate is not None:
                     return gate
+                # Execution timing: clock starts once the GPU is ours AND the
+                # settle gate has passed — the moment execution actually begins
+                # (stops when the inference run returns, any outcome).
+                exec_t0 = time.monotonic()
+                await self._record_exec_start(job_id)
                 unit_map = {u.ordinal: u for u in todo}
 
                 async def on_event(event: dict) -> None:
@@ -462,6 +468,9 @@ class JobProcessor:
                     [u.to_job_unit() for u in todo],
                     workdir, job_type, batch_id=batch_id, on_event=on_event)
             finally:
+                if exec_t0 is not None:
+                    await self._record_exec_ms(
+                        job_id, int((time.monotonic() - exec_t0) * 1000))
                 lease.release()
 
             # 6. finalize: at least one image must have been recorded.
@@ -578,6 +587,28 @@ class JobProcessor:
                             reference, self.settings.gpu_wait_timeout)
                 return AckDecision.NACK_REQUEUE
             await asyncio.sleep(self.settings.gpu_wait_interval)
+
+    async def _record_exec_start(self, job_id) -> None:
+        """Best-effort: stamp ``exec_started_at`` right before the pipeline call
+        (GPU lease held, settle gate passed). Swallowed — timing telemetry must
+        never abort the job (e.g. before the central migration has landed).
+        """
+        try:
+            await self.store.mark_exec_started(job_id)
+        except Exception:
+            logger.warning("could not stamp exec_started_at for job %s; continuing",
+                           job_id, exc_info=True)
+
+    async def _record_exec_ms(self, job_id, ms: int) -> None:
+        """Best-effort: persist the pipeline-call duration. Swallowed — callers
+        invoke this from a ``finally`` so it must never mask an in-flight
+        exception either.
+        """
+        try:
+            await self.store.set_execution_ms(job_id, ms)
+        except Exception:
+            logger.warning("could not record execution_ms for job %s; continuing",
+                           job_id, exc_info=True)
 
     async def _finalize_image(self, reference: str, job_id, ordinal: int,
                               produced_path: str | None, original_filename: str | None,
