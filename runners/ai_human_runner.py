@@ -3,7 +3,7 @@
 
 Invoked by the orchestrator as:
     conda run --no-capture-output -n refton python <runners>/ai_human_runner.py \
-        --job-json <workdir>/job.json
+        
 
 Contract (exit codes the consumer routes on):
     0  >= 1 image produced (per-image failures already reported)
@@ -18,7 +18,9 @@ Progress protocol: JSONL events on stdout (the orchestrator dispatches them):
 Everything else printed is transcript (goes to job.log).
 
 Params (central /jobs/ai-human schema, mirrored in viton_api.models):
-    person_type man|woman|child|auto   (auto + no reference -> man)
+    person_type man|woman|child|auto   (reference jobs: ALWAYS ignored — gender
+                                       derives from the reference image;
+                                       text jobs: auto + no reference -> man)
     pose, angle                        (pipeline enums)
     outfit XOR outfit_type             (free text or preset)
     extra_prompt                       free text
@@ -54,7 +56,7 @@ def die_poison(message: str) -> NoReturn:
 
 
 def validate_params(params: dict) -> str | None:
-    person_type = params.get("person_type", "man")
+    person_type = params.get("person_type", "auto")
     if person_type not in VALID_PERSON_TYPES:
         return f"invalid person_type {person_type!r}"
     if params.get("pose", "straight") not in VALID_POSES:
@@ -100,13 +102,15 @@ def main() -> None:
         sys.exit(2)
 
     base_seed = int(params.get("seed", 0))
-    person_type_param = params.get("person_type", "man")
+    # default "auto": with a reference the gender/age is derived from it;
+    # without one, the auto -> man fallback below keeps the old text-mode default
+    person_type_param = params.get("person_type", "auto")
     pose = params.get("pose", "straight")
     angle = params.get("angle", "front")
     outfit = params.get("outfit", "") or ""
     outfit_type = params.get("outfit_type", "") or ""
     extra_prompt = params.get("extra_prompt", "") or ""
-    steps = int(params.get("steps", 4))
+    steps = int(params.get("steps", 8))  # <8 invites extra-limb artifacts on raised-arm poses
 
     produced = 0
     oom = False
@@ -125,10 +129,14 @@ def main() -> None:
             emit({"event": "image_failed", "ordinal": ordinal,
                   "error": f"reference file missing: {ref}"})
             continue
+        # image-to-image: gender/age ALWAYS derives from the reference image —
+        # person_type is deliberately ignored here (clients were hardcoding
+        # "man" for reference jobs, forcing male output).
         # text mode + auto has no reference to derive from -> man
-        person_type = person_type_param
-        if person_type == "auto" and not ref:
-            person_type = "man"
+        if ref:
+            person_type = "auto"
+        else:
+            person_type = "man" if person_type_param == "auto" else person_type_param
 
         out_path = out_dir / f"{ordinal:04d}.png"
         try:
