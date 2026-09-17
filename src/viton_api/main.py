@@ -53,7 +53,19 @@ async def _create_pool(
     while True:
         try:
             return await asyncpg.create_pool(
-                dsn=settings.database_dsn, min_size=1, max_size=3
+                dsn=settings.database_dsn, min_size=1, max_size=3,
+                # The DB is hosted Supabase behind supavisor, which silently
+                # kills idle connections; a dead pooled connection costs a
+                # ~600ms rebuild (TLS + SCRAM) on the next acquire and can fail
+                # the query outright. TCP keepalives keep the pooled
+                # connections warm, and the inactive lifetime recycles them
+                # before long-idle kills land.
+                server_settings={
+                    "tcp_keepalives_idle": "30",
+                    "tcp_keepalives_interval": "10",
+                    "tcp_keepalives_count": "3",
+                },
+                max_inactive_connection_lifetime=300,
             )
         except asyncio.CancelledError:
             raise
