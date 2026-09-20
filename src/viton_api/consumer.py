@@ -37,6 +37,7 @@ from .models import (
     EXIT_POISON,
     SUPPORTED_JOB_TYPES,
     TERMINAL_STATUSES,
+    image_pct,
     parse_params,
     validate_ai_human_params,
     validate_viton_params,
@@ -406,7 +407,8 @@ class JobProcessor:
                 f"running ({len(todo)}/{image_count} images)")
             await self.orchestrator._emit(
                 reference, batch_id, status="running",
-                progress=round(done * 100 / image_count),
+                pct=image_pct(done, image_count),
+                progress=image_pct(done, image_count),
                 ordinal=0, images_total=image_count, images_done=done,
                 message=f"running ({len(todo)}/{image_count} images)")
 
@@ -435,16 +437,20 @@ class JobProcessor:
                     kind = event.get("event")
                     ordinal = int(event.get("ordinal", 0) or 0)
                     if kind == "image_done":
+                        # Increment FIRST so _finalize_image persists and emits
+                        # the same post-increment count (DB and SSE must agree,
+                        # and the store's ladder needs done INCLUDING this image).
+                        done += 1
                         unit = unit_map.get(ordinal)
                         await self._finalize_image(
                             reference, job_id, ordinal, event.get("path"),
                             unit.original_filename if unit else None,
-                            image_count, done)
-                        done += 1
+                            image_count, done, batch_id)
                     elif kind == "image_generated":
+                        pct = image_pct(done, image_count)
                         await self.orchestrator._emit(
                             reference, batch_id, status="running",
-                            progress=round(done * 100 / image_count),
+                            pct=pct, progress=pct,
                             ordinal=ordinal, images_total=image_count,
                             images_done=done,
                             message=f"image {ordinal + 1}/{image_count} generated")
@@ -453,9 +459,10 @@ class JobProcessor:
                         err = str(event.get("error") or "runner reported failure")
                         await self.store.add_event(
                             job_id, "pipeline", f"image {ordinal} failed: {err}")
+                        pct = image_pct(done, image_count)
                         await self.orchestrator._emit(
                             reference, batch_id, status="running",
-                            progress=round(done * 100 / image_count),
+                            pct=pct, progress=pct,
                             ordinal=ordinal, images_total=image_count,
                             images_done=done,
                             message=f"image {ordinal + 1}/{image_count} failed")
@@ -466,7 +473,8 @@ class JobProcessor:
                 await self.orchestrator.run(
                     job_id, reference, params,
                     [u.to_job_unit() for u in todo],
-                    workdir, job_type, batch_id=batch_id, on_event=on_event)
+                    workdir, job_type, batch_id=batch_id, on_event=on_event,
+                    progress_floor=image_pct(done, image_count))
             finally:
                 if exec_t0 is not None:
                     await self._record_exec_ms(
@@ -477,13 +485,14 @@ class JobProcessor:
             if done == 0:
                 raise StageFailed("pipeline", "exit 0 but no image_done events")
 
-            progress = round(done * 100 / image_count)
-            await self.store.mark_completed(job_id, progress)
+            # Completed reads 100 even when some images failed: a completed
+            # job's bar must read full — failures show in the images[] manifest.
+            await self.store.mark_completed(job_id, 100)
             await self.store.add_event(
                 job_id, "pipeline", f"completed ({done}/{image_count} images)")
             await self.orchestrator._emit(
                 reference, batch_id, status="completed",
-                progress=progress, current_stage=None,
+                pct=100, progress=100, current_stage=None,
                 ordinal=0, images_total=image_count, images_done=done,
                 message=f"completed ({done}/{image_count} images)")
             return AckDecision.ACK
@@ -612,7 +621,8 @@ class JobProcessor:
 
     async def _finalize_image(self, reference: str, job_id, ordinal: int,
                               produced_path: str | None, original_filename: str | None,
-                              image_count: int, done: int) -> None:
+                              image_count: int, done: int,
+                              batch_id: str | None = None) -> None:
         """Copy the runner's produced file into storage and record the output
         row + per-image completion (idempotent upsert)."""
         if not produced_path or not Path(produced_path).exists():
@@ -631,10 +641,13 @@ class JobProcessor:
         await self.store.record_image_output(
             job_id, ordinal, rel, size, "image/png", image_count, done,
             original_filename=original_filename)
+        # batch_id is threaded through so BATCH SSE watchers also receive the
+        # per-image ticks (the hub routes on both job_id and batch_id).
+        pct = image_pct(done, image_count)
         await self.orchestrator._emit(
-            reference, None, status="running",
-            progress=round((done + 1) * 100 / image_count),
-            ordinal=ordinal, images_total=image_count, images_done=done + 1,
+            reference, batch_id, status="running",
+            pct=pct, progress=pct,
+            ordinal=ordinal, images_total=image_count, images_done=done,
             message=f"image {ordinal + 1}/{image_count} done")
 
     async def _reject_unimplemented(self, reference: str, job_type: str) -> AckDecision:

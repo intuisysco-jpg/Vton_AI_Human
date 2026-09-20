@@ -169,7 +169,8 @@ class Orchestrator:
 
     async def run(self, job_id, reference: str, params: dict, units: list[dict],
                   workdir, job_type: str, *, batch_id: str | None = None,
-                  on_event: EventCallback | None = None) -> None:
+                  on_event: EventCallback | None = None,
+                  progress_floor: int = 0) -> None:
         """Run the single stage for one job. Raises StageFailed (with the
         runner's exit code when available) or JobCancelled."""
         try:
@@ -191,10 +192,11 @@ class Orchestrator:
         try:
             if await self.store.is_cancel_requested(job_id):
                 raise JobCancelled()
-            await self.store.set_stage_progress(job_id, spec.key, STAGE_PROGRESS[spec.key])
+            start_pct = max(STAGE_PROGRESS[spec.key], progress_floor)
+            await self.store.set_stage_progress(job_id, spec.key, start_pct)
             await self.store.add_event(job_id, spec.key, "started")
             await self._emit(reference, batch_id, status="running", current_stage=spec.key,
-                             progress=STAGE_PROGRESS[spec.key],
+                             pct=start_pct, progress=start_pct,
                              message=f"{spec.key} started")
 
             async def cancel_check() -> bool:
@@ -205,8 +207,11 @@ class Orchestrator:
             await self._run_cmd(spec, cmd, spec._cwd(ctx), joblog, timeout,
                                 cancel_check, on_event=on_event)
             await self.store.add_event(job_id, spec.key, "done")
+            # Stage END, not its BASE: per-image frames have already climbed
+            # the ladder by the time the runner exits; re-sending 50 would
+            # visibly yank the bar backward.
             await self._emit(reference, batch_id, status="running", current_stage=spec.key,
-                             progress=STAGE_PROGRESS[spec.key], message=f"{spec.key} done")
+                             pct=100, progress=100, message=f"{spec.key} done")
         finally:
             joblog.close()
 

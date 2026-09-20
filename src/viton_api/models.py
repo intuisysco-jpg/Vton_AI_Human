@@ -38,6 +38,19 @@ STAGE_PROGRESS = {
     "viton": 50,
 }
 
+
+def image_pct(done: int, n: int) -> int:
+    """Map ``done`` finalized images of ``n`` into the stage window (50 -> 100).
+
+    The ONE ladder shared by the DB ``jobs.progress`` writes and the SSE
+    frames, so polls and streams always agree and never move backward (the
+    stage start writes 50; the first image must land >= 50, not 1/N*100).
+    """
+    if not n:
+        return 100
+    base = STAGE_PROGRESS["viton"]
+    return min(100, base + round((100 - base) * done / n))
+
 # job_type -> (stage_key, Settings attr for the conda env, Settings attr for the probe cwd tree)
 JOB_TYPE_TO_STAGE = {
     "ai_human": ("ai_human", "conda_env", "ai_human_dir"),

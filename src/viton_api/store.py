@@ -18,6 +18,8 @@ import uuid
 
 import asyncpg
 
+from .models import image_pct
+
 _ERR_TRUNC = 4000
 
 
@@ -98,8 +100,12 @@ class PostgresStore:
         )
 
     async def set_stage_progress(self, job_id, stage: str, pct: int) -> None:
+        """Stage bookkeeping write; progress is monotonic (GREATEST) so a
+        redelivery whose already-finalized images advanced the bar can't pull
+        it back down to the stage-start value."""
         await self.pool.execute(
-            "UPDATE jobs SET current_stage=$2, progress=$3, updated_at=now() WHERE id = $1",
+            "UPDATE jobs SET current_stage=$2, progress=GREATEST(progress, $3), "
+            "updated_at=now() WHERE id = $1",
             job_id, stage, pct,
         )
 
@@ -164,11 +170,14 @@ class PostgresStore:
 
         One transaction: upsert the image's output row (mirroring the primary
         input's ``original_filename``), mark its input rows completed, and
-        advance the aggregate ``jobs.progress`` to ``round(done/image_count*100)``.
-        The job row is flipped to ``completed`` separately by
-        :meth:`mark_completed` once every image has been processed.
+        advance the aggregate ``jobs.progress`` along the shared stage-window
+        ladder (:func:`viton_api.models.image_pct`). ``done`` is the count
+        INCLUDING this image; the write is monotonic (GREATEST) so progress
+        never regresses below the stage-start value. The job row is flipped to
+        ``completed`` separately by :meth:`mark_completed` once every image has
+        been processed.
         """
-        pct = round(done * 100 / image_count) if image_count else 100
+        pct = image_pct(done, image_count)
         async with self.pool.acquire() as conn:
             async with conn.transaction():
                 await conn.execute(
@@ -188,15 +197,16 @@ class PostgresStore:
                     job_id, ordinal,
                 )
                 await conn.execute(
-                    "UPDATE jobs SET progress = $2, updated_at = now() WHERE id = $1",
+                    "UPDATE jobs SET progress = GREATEST(progress, $2), "
+                    "updated_at = now() WHERE id = $1",
                     job_id, pct,
                 )
 
     async def mark_completed(self, job_id, progress: int = 100) -> None:
         """One transaction: jobs -> completed + completion event.
 
-        ``progress`` defaults to 100 for a fully-successful job; a partially
-        failed job passes its real ``round(done/image_count*100)``.
+        ``progress`` is 100: a completed job's bar must read full — per-image
+        failures are visible in the ``job_files`` manifest, not the aggregate.
         """
         async with self.pool.acquire() as conn:
             async with conn.transaction():
