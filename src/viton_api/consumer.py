@@ -113,6 +113,9 @@ class RabbitConsumer:
         self._inflight: asyncio.Future | None = None
         self._connected = False
         self._progress: ProgressPublisher | None = None
+        # Serializes job processing across BOTH consumed queues (see
+        # _setup_channel: the channel-level global prefetch cap is gone).
+        self._job_lock = asyncio.Lock()
 
     @property
     def connected(self) -> bool:
@@ -135,7 +138,7 @@ class RabbitConsumer:
                 ok = await self._setup_channel()
                 self._connected = ok
                 if ok:
-                    logger.info("consumer connected (prefetch=1, global_=True)")
+                    logger.info("consumer connected (prefetch=1, global_=False)")
                     backoff = 1.0
                     self._progress = ProgressPublisher()
                     await self._progress.start(self._connection)
@@ -150,7 +153,12 @@ class RabbitConsumer:
         await self._close()
 
     async def _setup_channel(self) -> bool:
-        await self._channel.set_qos(prefetch_count=1, global_=True)
+        # Per-consumer prefetch (global_=False): RabbitMQ 4 deprecates the
+        # channel-wide cap (global_=True — deprecation errors today, removal
+        # in a future major). The channel no longer enforces "one unacked
+        # TOTAL across both queues"; the _on_message job lock now enforces
+        # the single-GPU-job invariant instead.
+        await self._channel.set_qos(prefetch_count=1, global_=False)
         required_ok = True
         # BOTH queues are required: dropping one would silently split the
         # single-unacked-message invariant across pipelines.
@@ -181,7 +189,12 @@ class RabbitConsumer:
             return
         self._inflight = asyncio.get_running_loop().create_future()
         try:
-            decision = await self._handle_message(message)
+            # One job at a time across BOTH queues: with per-consumer prefetch
+            # (global_=False) the channel no longer enforces the single-unacked
+            # invariant, so this lock does. A second delivered message just
+            # waits here in worker memory (broker sees <=2 unacked).
+            async with self._job_lock:
+                decision = await self._handle_message(message)
         except Exception as e:  # noqa: BLE001 — never let the consumer task die
             logger.exception("unhandled error processing message: %s", e)
             decision = AckDecision.NACK_REQUEUE
@@ -227,12 +240,15 @@ class RabbitConsumer:
     async def stop(self) -> None:
         self._stop_requested = True
         self._stop_event.set()
-        # let the running job finish
+        # Bounded on purpose: a GPU job mid-flight is NOT drained (too long);
+        # its message stays unacked and the broker requeues it once the
+        # connection drops. Previously this wait was unbounded (timeout=None),
+        # so a long job at SIGTERM meant docker's stop timeout SIGKILLed us.
         if self._inflight is not None and not self._inflight.done():
             try:
-                await asyncio.wait_for(self._inflight, timeout=None)
+                await asyncio.wait_for(self._inflight, timeout=10.0)
             except asyncio.TimeoutError:
-                pass
+                logger.warning("job still in flight at shutdown; abandoning (message requeues)")
         if self._task is not None:
             self._task.cancel()
             try:
@@ -240,23 +256,30 @@ class RabbitConsumer:
             except asyncio.CancelledError:
                 pass
             self._task = None
+        # The cancelled _run task never reaches its trailing _close() (the
+        # CancelledError propagates past it), so tear the AMQP side down here.
+        # Bounded so a broker already gone at shutdown can't hang us past the
+        # compose stop_grace_period (budget: 5+5+5 = 15s of a 30s window).
+        await self._close()
 
     async def _close(self) -> None:
+        # Every close is bounded + swallowed: these must never hang or raise
+        # past shutdown (a dead broker transport can stall a close forever).
         if self._progress is not None:
             try:
-                await self._progress.close()
+                await asyncio.wait_for(self._progress.close(), timeout=5.0)
             except Exception:  # noqa: BLE001
                 pass
             self._progress = None
             self.processor.orchestrator.progress_publisher = None
         try:
             if self._channel is not None and self._channel.is_closed is False:
-                await self._channel.close()
+                await asyncio.wait_for(self._channel.close(), timeout=5.0)
         except Exception:  # noqa: BLE001
             pass
         try:
             if self._connection is not None and self._connection.is_closed is False:
-                await self._connection.close()
+                await asyncio.wait_for(self._connection.close(), timeout=5.0)
         except Exception:  # noqa: BLE001
             pass
         self._connected = False
