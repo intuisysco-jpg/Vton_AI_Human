@@ -17,6 +17,7 @@ from __future__ import annotations
 import uuid
 
 import asyncpg
+from .fencing import FencedPool
 
 from .models import image_pct
 
@@ -25,7 +26,7 @@ _ERR_TRUNC = 4000
 
 class PostgresStore:
     def __init__(self, pool: asyncpg.Pool):
-        self.pool = pool
+        self.pool = FencedPool(pool)
 
     # --- reads ----------------------------------------------------------- #
     async def get_job_by_reference(self, reference: str) -> dict | None:
@@ -132,7 +133,7 @@ class PostgresStore:
     async def mark_failed(self, job_id, err: str) -> int:
         """Atomic: set failed AND bump retry_count, returning the new count."""
         row = await self.pool.fetchrow(
-            "UPDATE jobs SET status='failed', error_message=$2, retry_count=retry_count+1, "
+            "UPDATE jobs SET status='retrying', error_message=$2, retry_count=retry_count+1, "
             "updated_at=now() WHERE id = $1 RETURNING retry_count",
             job_id, (err or "")[:_ERR_TRUNC],
         )

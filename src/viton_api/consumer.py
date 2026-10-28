@@ -17,6 +17,7 @@ AckDecision semantics (worker blueprint Appendix D):
 """
 
 from __future__ import annotations
+from .fencing import fenced, attempt_path
 
 import asyncio
 import json
@@ -294,6 +295,7 @@ class JobProcessor:
         self.gpu_reporter = gpu_reporter
 
     # ------------------------------------------------------------------ #
+    @fenced
     async def process(self, reference: str, job_type: str) -> AckDecision:
         # 1. supported job_type?
         if job_type not in SUPPORTED_JOB_TYPES:
@@ -655,11 +657,11 @@ class JobProcessor:
             logger.warning("reference %s: image %d output missing", reference, ordinal)
             return
         storage = Path(self.settings.storage_root)
-        out_root = storage / reference / "output"
+        out_root = storage / reference / "output" / attempt_path(reference)
         await asyncio.to_thread(out_root.mkdir, parents=True, exist_ok=True)
         dest = out_root / f"{ordinal:04d}.png"
         await asyncio.to_thread(shutil.copy2, produced_path, str(dest))
-        rel = f"{reference}/output/{dest.name}"
+        rel = f"{reference}/output/{attempt_path(reference)}/{dest.name}"
         size = dest.stat().st_size
         await self.store.record_image_output(
             job_id, ordinal, rel, size, "image/png", image_count, done,

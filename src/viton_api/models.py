@@ -23,7 +23,7 @@ class JobStatus:
 
 # `failed` is NOT terminal — it can be retried. Only completed/cancelled stop
 # further processing (idempotent redelivery -> ACK without re-run).
-TERMINAL_STATUSES = {"completed", "cancelled"}
+TERMINAL_STATUSES = {"completed", "cancelled", "failed"}
 
 
 # --------------------------------------------------------------------------- #
