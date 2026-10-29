@@ -32,7 +32,7 @@ class GpuStatusReporter:
         self._nvml_ok = False
 
     async def start(self) -> None:
-        await self._ensure_table()
+        await self._check_table()
         self._init_nvml()
         self._task = asyncio.create_task(self._beat_loop(), name="gpu-status")
 
@@ -48,20 +48,9 @@ class GpuStatusReporter:
             self._handle = None
             logger.warning("NVML unavailable (gpu status will be null): %s", e)
 
-    async def _ensure_table(self) -> None:
-        await self.pool.execute(
-            """
-            CREATE TABLE IF NOT EXISTS gpu_status (
-                gpu_id      TEXT PRIMARY KEY,
-                total_mb    BIGINT,
-                used_mb     BIGINT,
-                free_mb     BIGINT,
-                utilization INTEGER,
-                current_job TEXT,
-                reported_at TIMESTAMPTZ NOT NULL DEFAULT now()
-            )
-            """
-        )
+    async def _check_table(self) -> None:
+        """Check the migration-owned table without requesting DDL privileges."""
+        await self.pool.execute("SELECT gpu_id, total_mb, used_mb, free_mb, utilization, current_job, reported_at FROM public.gpu_status LIMIT 0")
 
     async def _beat_loop(self) -> None:
         while not self._stop.is_set():
@@ -92,7 +81,7 @@ class GpuStatusReporter:
 
         await self.pool.execute(
             """
-            INSERT INTO gpu_status (gpu_id, total_mb, used_mb, free_mb, utilization, current_job, reported_at)
+            INSERT INTO public.gpu_status (gpu_id, total_mb, used_mb, free_mb, utilization, current_job, reported_at)
             VALUES ($1, $2, $3, $4, $5, $6, now())
             ON CONFLICT (gpu_id) DO UPDATE SET
               total_mb=EXCLUDED.total_mb, used_mb=EXCLUDED.used_mb, free_mb=EXCLUDED.free_mb,
