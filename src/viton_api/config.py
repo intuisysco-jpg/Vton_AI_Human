@@ -41,8 +41,10 @@ class Settings(BaseSettings):
     refton_dir: Path = Field(default=_VITON_ROOT / "RefTon")
     vosr_dir: Path = Field(default=_VITON_ROOT / "tools" / "VOSR")
 
-    # --- conda env for BOTH pipelines (refton box) ---
-    conda_env: str = "refton"
+    # Shared ML runtime, verified for both pipelines on the GPU server.
+    conda_env: str = Field(
+        default="qwen21", min_length=1, pattern=r"^[A-Za-z0-9_][A-Za-z0-9_.-]*$"
+    )
 
     device: str = "cuda:0"
 
@@ -113,8 +115,7 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("VT_MAX_RETRIES", "MAX_RETRIES"),
     )
 
-    # queues consumed on ONE channel (prefetch=1, global_=True) -> one GPU job
-    # at a time across BOTH pipelines.
+    # One consumer per queue; the processor lock serializes both pipelines.
     queue_names: list[str] = Field(
         default_factory=lambda: ["ai_human_queue", "viton_queue"]
     )
@@ -125,16 +126,28 @@ class Settings(BaseSettings):
         """asyncpg DSN (drop the SQLAlchemy `+asyncpg` driver suffix)."""
         return self.database_url.replace("+asyncpg", "")
 
+    def conda_command(self, *arguments: str) -> list[str]:
+        """Use one environment selection for probes and actual inference."""
+        return ["conda", "run", "--no-capture-output", "-n", self.conda_env, *arguments]
+
     def gpu_free_mb_for(self, job_type: str) -> int:
-        return self.gpu_free_mb_viton if job_type == "viton" else self.gpu_free_mb_ai_human
+        return (
+            self.gpu_free_mb_viton if job_type == "viton" else self.gpu_free_mb_ai_human
+        )
 
     def timeout_base_for(self, job_type: str) -> int:
         return self.timeout_viton if job_type == "viton" else self.timeout_ai_human
 
     def per_image_s_for(self, job_type: str) -> float:
-        return self.stage_per_image_s_viton if job_type == "viton" else self.stage_per_image_s_ai_human
+        return (
+            self.stage_per_image_s_viton
+            if job_type == "viton"
+            else self.stage_per_image_s_ai_human
+        )
 
-    def conda_subprocess_env(self, extra: dict[str, str] | None = None) -> dict[str, str]:
+    def conda_subprocess_env(
+        self, extra: dict[str, str] | None = None
+    ) -> dict[str, str]:
         """Environment for `conda run` subprocesses.
 
         When launched via `uv run`, VIRTUAL_ENV gives the thin venv precedence
@@ -148,13 +161,16 @@ class Settings(BaseSettings):
         if virtual_env:
             virtual_bin = os.path.normpath(str(Path(virtual_env) / "bin"))
             env["PATH"] = os.pathsep.join(
-                p for p in env.get("PATH", "").split(os.pathsep)
+                p
+                for p in env.get("PATH", "").split(os.pathsep)
                 if os.path.normpath(p) != virtual_bin
             )
         # The runner scripts locate the ML trees through these (single source:
         # the .env / compose already carry the VT_ values).
-        env.setdefault("VT_AI_HUMAN_DIR", str(self.ai_human_dir))
-        env.setdefault("VT_REFTON_DIR", str(self.refton_dir))
+        env["VT_CONDA_ENV"] = self.conda_env
+        env["VT_AI_HUMAN_DIR"] = str(self.ai_human_dir)
+        env["VT_REFTON_DIR"] = str(self.refton_dir)
+        env["VT_VOSR_DIR"] = str(self.vosr_dir)
         if extra:
             env.update(extra)
         # expandable allocator reduces fragmentation/OOM on the shared GPU; an

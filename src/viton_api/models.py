@@ -153,7 +153,10 @@ class Health(BaseModel):
     conda_env: str = ""
     queues: list[str] = []
     stage_availability: dict[str, bool] = {}
+    stage_reasons: dict[str, str] = {}
     rabbit_connected: bool = False
+    consumer_connected: bool = False
     db_connected: bool = False
+    startup_error: str | None = None
     storage_root: str = ""
     gpu: GpuHealth | None = None

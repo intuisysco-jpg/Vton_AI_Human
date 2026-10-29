@@ -1,7 +1,7 @@
 """RabbitMQ consumer + per-job processor.
 
-RabbitConsumer  — broker lifecycle (one shared channel, prefetch=1 global_=True
-  => at most one unacked message => one GPU job at a time across BOTH queues;
+RabbitConsumer  — broker lifecycle (one shared channel, prefetch=1 per queue;
+  one processor lock => one GPU job at a time across BOTH queues;
   robust reconnect; DLQ-first declare; poison = ACK).
 JobProcessor    — the per-job contract (DB + storage + orchestrator); no broker
   I/O.
@@ -22,6 +22,8 @@ from .fencing import fenced, attempt_path
 import asyncio
 import json
 import logging
+from functools import partial
+import random
 import shutil
 import time
 import uuid
@@ -48,6 +50,8 @@ from .progress_publisher import ProgressPublisher
 from .store import PostgresStore
 
 logger = logging.getLogger("viton_api.consumer")
+_RESTORE_TIMEOUT = 30.0
+_WATCH_INTERVAL = 5.0
 
 
 class MissingInputError(Exception):
@@ -72,8 +76,8 @@ class Unit:
     ordinal: int
     original_filename: str | None
     reference_rel: str | None = None  # ai_human mode B (text): None
-    person_rel: str | None = None     # viton
-    garment_rel: str | None = None    # viton
+    person_rel: str | None = None  # viton
+    garment_rel: str | None = None  # viton
     reference: Path | None = None
     person: Path | None = None
     garment: Path | None = None
@@ -111,8 +115,11 @@ class RabbitConsumer:
         self._task: asyncio.Task | None = None
         self._stop_event = asyncio.Event()
         self._stop_requested = False
-        self._inflight: asyncio.Future | None = None
+        self._inflight: set[asyncio.Future] = set()
         self._connected = False
+        self._session_ready = asyncio.Event()
+        self.last_error: str | None = None
+        self._disconnected_at: float | None = None
         self._progress: ProgressPublisher | None = None
         # Serializes job processing across BOTH consumed queues (see
         # _setup_channel: the channel-level global prefetch cap is gone).
@@ -120,38 +127,124 @@ class RabbitConsumer:
 
     @property
     def connected(self) -> bool:
-        return self._connected
+        return bool(
+            self._connected
+            and self.broker_connected
+            and self._channel is not None
+            and not self._channel.is_closed
+            and len(self._consumer_tags) == len(self.settings.queue_names)
+            and not self._stop_requested
+        )
+
+    @property
+    def broker_connected(self) -> bool:
+        return bool(
+            self._connection is not None
+            and not self._connection.is_closed
+            and self._connection.connected.is_set()
+        )
+
+    def _publish_state(self) -> None:
+        self.app.state.rabbit_connected = self.broker_connected
+        self.app.state.consumer_connected = self.connected
+
+    def _on_disconnect(self, sender, *args) -> None:
+        if sender is self._connection or sender is self._channel:
+            self._connected = False
+            self._session_ready.clear()
+            if self._disconnected_at is None:
+                self._disconnected_at = time.monotonic()
+            self.last_error = "Broker connection or subscription interrupted"
+            self._publish_state()
+
+    def _on_restored(self, sender, *args) -> None:
+        if sender is self._connection or sender is self._channel:
+            # Robust channels call this after their queues and consumers restore.
+            self._connected = len(self._consumer_tags) == len(self.settings.queue_names)
+            if self.connected:
+                self.last_error = None
+                self._disconnected_at = None
+                self._session_ready.set()
+            self._publish_state()
 
     def start(self) -> asyncio.Task:
+        if self._task is not None and not self._task.done():
+            return self._task
+        if self._stop_requested:
+            raise RuntimeError("A stopped consumer cannot be restarted")
         self._task = asyncio.create_task(self._run(), name="rabbit-consumer")
         return self._task
 
     async def _run(self) -> None:
         backoff = 1.0
-        while not self._stop_event.is_set():
-            try:
-                if self._progress is not None:
-                    await self._progress.close()
-                    self._progress = None
-                    self.processor.orchestrator.progress_publisher = None
-                self._connection = await aio_pika.connect_robust(self.settings.rabbitmq_url)
-                self._channel = await self._connection.channel()
-                ok = await self._setup_channel()
-                self._connected = ok
-                if ok:
+        try:
+            while not self._stop_event.is_set():
+                try:
+                    self._session_ready = asyncio.Event()
+                    self._connection = await aio_pika.connect_robust(
+                        self.settings.rabbitmq_url,
+                        timeout=10,
+                    )
+                    self._connection.close_callbacks.add(self._on_disconnect)
+                    self._connection.reconnect_callbacks.add(self._on_restored)
+                    self._channel = await self._connection.channel()
+                    self._channel.close_callbacks.add(self._on_disconnect)
+                    self._channel.reopen_callbacks.add(self._on_restored)
+                    await asyncio.wait_for(self._setup_channel(), timeout=20)
+                    self._connected = True
+                    self._disconnected_at = None
+                    self.last_error = None
+                    self._publish_state()
+                    self._session_ready.set()
                     logger.info("consumer connected (prefetch=1, global_=False)")
                     backoff = 1.0
                     self._progress = ProgressPublisher()
-                    await self._progress.start(self._connection)
-                    self.processor.orchestrator.progress_publisher = self._progress
-                await self._stop_event.wait()
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:  # noqa: BLE001
-                logger.warning("consumer connect error (retry in %.1fs): %s", backoff, e)
-                await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, 30.0)
-        await self._close()
+                    try:
+                        await asyncio.wait_for(
+                            self._progress.start(self._connection), timeout=10
+                        )
+                        self.processor.orchestrator.progress_publisher = self._progress
+                    except Exception as exc:
+                        logger.warning(
+                            "Optional progress publisher unavailable: %s",
+                            type(exc).__name__,
+                        )
+                        await self._close_resource(self._progress)
+                        self._progress = None
+                    # Native robust recovery restores the SAME subscriptions;
+                    # callbacks above clear/restore readiness during outages.
+                    await self._watch_connection()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    self.last_error = f"Consumer setup failed: {type(exc).__name__}"
+                    logger.warning("%s; retry in %.1fs", self.last_error, backoff)
+                    await self._close()
+                    await self._wait_retry(
+                        min(30.0, backoff * random.uniform(0.8, 1.2))
+                    )
+                    backoff = min(backoff * 2, 30.0)
+        finally:
+            await self._close()
+
+    async def _wait_retry(self, delay: float) -> None:
+        try:
+            await asyncio.wait_for(self._stop_event.wait(), timeout=delay)
+        except asyncio.TimeoutError:
+            pass
+
+    async def _watch_connection(self) -> None:
+        # A native reconnect normally restores subscriptions immediately. Bound
+        # stalled channel restoration too, without timing out any GPU work.
+        while not self._stop_event.is_set():
+            if not self.connected:
+                if self._disconnected_at is None:
+                    self._disconnected_at = time.monotonic()
+                if time.monotonic() - self._disconnected_at >= _RESTORE_TIMEOUT:
+                    raise ConnectionError("Broker subscriptions did not recover")
+            else:
+                self._disconnected_at = None
+            await self._wait_retry(_WATCH_INTERVAL)
 
     async def _setup_channel(self) -> bool:
         # Per-consumer prefetch (global_=False): RabbitMQ 4 deprecates the
@@ -160,49 +253,72 @@ class RabbitConsumer:
         # TOTAL across both queues"; the _on_message job lock now enforces
         # the single-GPU-job invariant instead.
         await self._channel.set_qos(prefetch_count=1, global_=False)
-        required_ok = True
-        # BOTH queues are required: dropping one would silently split the
-        # single-unacked-message invariant across pipelines.
+        if not self.settings.queue_names or len(set(self.settings.queue_names)) != len(
+            self.settings.queue_names
+        ):
+            raise ValueError("Consumer queues must be non-empty and unique")
+        callback = partial(
+            self._on_message, connection=self._connection, ready=self._session_ready
+        )
+        # Partial setup is a failed session. The caller closes the connection,
+        # requeues its deliveries and retries the complete set of subscriptions.
         for queue in self.settings.queue_names:
             dlq = dlq_name_for(queue)
-            try:
-                # declare the DLQ first — a dead-letter to a missing DLQ is dropped.
-                await self._channel.declare_queue(dlq, durable=True)
-                main = await self._channel.declare_queue(
-                    queue,
-                    durable=True,
-                    arguments={
-                        "x-dead-letter-exchange": "",
-                        "x-dead-letter-routing-key": dlq,
-                    },
-                )
-                tag = await main.consume(self._on_message, no_ack=False)
-                self._consumer_tags.append(tag)
-                logger.info("consuming %s (dlq=%s)", queue, dlq)
-            except Exception as e:  # noqa: BLE001
-                logger.error("FAILED to consume required queue %s: %s", queue, e)
-                required_ok = False
-        return required_ok
+            await self._channel.declare_queue(dlq, durable=True)
+            main = await self._channel.declare_queue(
+                queue,
+                durable=True,
+                arguments={
+                    "x-dead-letter-exchange": "",
+                    "x-dead-letter-routing-key": dlq,
+                },
+            )
+            tag = await main.consume(callback, no_ack=False)
+            self._consumer_tags.append(tag)
+            logger.info("consuming %s (dlq=%s)", queue, dlq)
+        return True
 
-    async def _on_message(self, message: aio_pika.abc.AbstractIncomingMessage) -> None:
-        if self._stop_requested:
-            await message.nack(requeue=True)
+    async def _on_message(
+        self,
+        message: aio_pika.abc.AbstractIncomingMessage,
+        *,
+        connection=None,
+        ready=None,
+    ) -> None:
+        if ready is not None:
+            await ready.wait()
+        if self._stop_requested or (
+            connection is not None
+            and (connection is not self._connection or not self.connected)
+        ):
+            await self._acknowledge(message, AckDecision.NACK_REQUEUE)
             return
-        self._inflight = asyncio.get_running_loop().create_future()
+        inflight = asyncio.get_running_loop().create_future()
+        self._inflight.add(inflight)
         try:
             # One job at a time across BOTH queues: with per-consumer prefetch
             # (global_=False) the channel no longer enforces the single-unacked
             # invariant, so this lock does. A second delivered message just
             # waits here in worker memory (broker sees <=2 unacked).
             async with self._job_lock:
-                decision = await self._handle_message(message)
+                if self._stop_requested or (
+                    connection is not None and connection is not self._connection
+                ):
+                    decision = AckDecision.NACK_REQUEUE
+                else:
+                    decision = await self._handle_message(message)
         except Exception as e:  # noqa: BLE001 — never let the consumer task die
-            logger.exception("unhandled error processing message: %s", e)
+            logger.error("Message processing interrupted: %s", type(e).__name__)
             decision = AckDecision.NACK_REQUEUE
+            await self._wait_retry(1.0)
         finally:
-            if not self._inflight.done():
-                self._inflight.set_result(None)
+            if not inflight.done():
+                inflight.set_result(None)
+            self._inflight.discard(inflight)
 
+        await self._acknowledge(message, decision)
+
+    async def _acknowledge(self, message, decision) -> None:
         try:
             if decision == AckDecision.ACK:
                 await message.ack()
@@ -211,9 +327,11 @@ class RabbitConsumer:
             elif decision == AckDecision.NACK_DLQ:
                 await message.nack(requeue=False)
         except Exception as e:  # noqa: BLE001
-            logger.warning("ack/nack failed: %s", e)
+            logger.warning("ack/nack failed: %s", type(e).__name__)
 
-    async def _handle_message(self, message: aio_pika.abc.AbstractIncomingMessage) -> AckDecision:
+    async def _handle_message(
+        self, message: aio_pika.abc.AbstractIncomingMessage
+    ) -> AckDecision:
         try:
             payload = json.loads(message.body.decode("utf-8"))
         except Exception:
@@ -241,15 +359,25 @@ class RabbitConsumer:
     async def stop(self) -> None:
         self._stop_requested = True
         self._stop_event.set()
+        self._session_ready.set()
+        self._connected = False
+        self._publish_state()
         # Bounded on purpose: a GPU job mid-flight is NOT drained (too long);
         # its message stays unacked and the broker requeues it once the
         # connection drops. Previously this wait was unbounded (timeout=None),
         # so a long job at SIGTERM meant docker's stop timeout SIGKILLed us.
-        if self._inflight is not None and not self._inflight.done():
+        if self._inflight:
             try:
-                await asyncio.wait_for(self._inflight, timeout=10.0)
+                await asyncio.wait_for(
+                    asyncio.gather(
+                        *(asyncio.shield(future) for future in tuple(self._inflight))
+                    ),
+                    timeout=10.0,
+                )
             except asyncio.TimeoutError:
-                logger.warning("job still in flight at shutdown; abandoning (message requeues)")
+                logger.warning(
+                    "job still in flight at shutdown; abandoning (message requeues)"
+                )
         if self._task is not None:
             self._task.cancel()
             try:
@@ -257,33 +385,32 @@ class RabbitConsumer:
             except asyncio.CancelledError:
                 pass
             self._task = None
-        # The cancelled _run task never reaches its trailing _close() (the
-        # CancelledError propagates past it), so tear the AMQP side down here.
-        # Bounded so a broker already gone at shutdown can't hang us past the
-        # compose stop_grace_period (budget: 5+5+5 = 15s of a 30s window).
+        # Idempotent fallback after _run's finally; resource closes run in
+        # parallel with a five-second limit, including during broker outages.
         await self._close()
 
     async def _close(self) -> None:
-        # Every close is bounded + swallowed: these must never hang or raise
-        # past shutdown (a dead broker transport can stall a close forever).
-        if self._progress is not None:
-            try:
-                await asyncio.wait_for(self._progress.close(), timeout=5.0)
-            except Exception:  # noqa: BLE001
-                pass
-            self._progress = None
-            self.processor.orchestrator.progress_publisher = None
-        try:
-            if self._channel is not None and self._channel.is_closed is False:
-                await asyncio.wait_for(self._channel.close(), timeout=5.0)
-        except Exception:  # noqa: BLE001
-            pass
-        try:
-            if self._connection is not None and self._connection.is_closed is False:
-                await asyncio.wait_for(self._connection.close(), timeout=5.0)
-        except Exception:  # noqa: BLE001
-            pass
+        progress, channel, connection = self._progress, self._channel, self._connection
+        self._progress = self._channel = self._connection = None
+        self.processor.orchestrator.progress_publisher = None
+        self._consumer_tags.clear()
         self._connected = False
+        self._session_ready.set()
+        self._publish_state()
+        await asyncio.gather(
+            *(
+                self._close_resource(resource)
+                for resource in (progress, channel, connection)
+                if resource is not None
+            )
+        )
+
+    @staticmethod
+    async def _close_resource(resource) -> None:
+        try:
+            await asyncio.wait_for(resource.close(), timeout=5.0)
+        except Exception:
+            pass
 
 
 class JobProcessor:

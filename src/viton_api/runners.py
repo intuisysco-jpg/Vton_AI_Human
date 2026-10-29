@@ -74,12 +74,8 @@ class StageSpec:
         return str(getattr(ctx.settings, self.tree_attr))
 
     def build_cmd(self, ctx: StageContext) -> list[str]:
-        conda_env = getattr(ctx.settings, self.env_attr)
         job_json = ctx.job_json or ctx.write_job_json()
-        return [
-            "conda", "run", "--no-capture-output", "-n", conda_env,
-            "python", self._script(ctx), "--job-json", str(job_json),
-        ]
+        return ctx.settings.conda_command("python", self._script(ctx), "--job-json", str(job_json))
 
 
 class AiHumanStage(StageSpec):

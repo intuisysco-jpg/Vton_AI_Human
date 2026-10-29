@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import socket
+from datetime import datetime, timezone
 
 from .config import Settings
 
@@ -33,7 +34,7 @@ class GpuStatusReporter:
 
     async def start(self) -> None:
         await self._check_table()
-        self._init_nvml()
+        await asyncio.to_thread(self._init_nvml)
         self._task = asyncio.create_task(self._beat_loop(), name="gpu-status")
 
     def _init_nvml(self) -> None:
@@ -98,6 +99,7 @@ class GpuStatusReporter:
             "free_mb": reading["free_mb"],
             "utilization": reading["utilization"],
             "current_job": current_job,
+            "reported_at": datetime.now(timezone.utc).isoformat(),
         }
 
     def _read_nvml(self) -> dict:
