@@ -54,7 +54,7 @@ def image_pct(done: int, n: int) -> int:
 # job_type -> (stage_key, Settings attr for the conda env, Settings attr for the probe cwd tree)
 JOB_TYPE_TO_STAGE = {
     "ai_human": ("ai_human", "conda_env", "ai_human_dir"),
-    "viton": ("viton", "conda_env", "refton_dir"),
+    "viton": ("viton", "conda_env", "service_root"),
 }
 
 SUPPORTED_JOB_TYPES = frozenset(JOB_TYPE_TO_STAGE.keys())
@@ -128,11 +128,9 @@ def validate_ai_human_params(params: dict) -> str | None:
 
 def validate_viton_params(params: dict) -> str | None:
     """Return an error message for a bad viton params dict, else None."""
-    if params.get("garment_type") is not None and params["garment_type"] not in GARMENT_TYPES:
-        return f"invalid garment_type {params.get('garment_type')!r}"
-    if params.get("garment_type") and params.get("garment_prompt"):
-        return "provide either 'garment_type' or 'garment_prompt', not both"
-    return None
+    from .tryon_params import validate_params
+    return validate_params(params)
+
 
 
 # --------------------------------------------------------------------------- #

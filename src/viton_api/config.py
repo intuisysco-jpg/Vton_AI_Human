@@ -41,6 +41,9 @@ class Settings(BaseSettings):
     refton_dir: Path = Field(default=_VITON_ROOT / "RefTon")
     vosr_dir: Path = Field(default=_VITON_ROOT / "tools" / "VOSR")
 
+    qwen_model_dir: Path = Path("/nvme0n1-disk/cache/huggingface/hub/Qwen_2.1")
+    accessory_lora_path: Path = _VITON_ROOT / "qwen21_tryon_test/qwen_lora/models/Garments2Look-LoRA/Qwen-Image-2.1-LoRA-2-refer-97068-editing-epoch-0.safetensors"
+
     # Shared ML runtime, verified for both pipelines on the GPU server.
     conda_env: str = Field(
         default="qwen21", min_length=1, pattern=r"^[A-Za-z0-9_][A-Za-z0-9_.-]*$"
@@ -72,7 +75,7 @@ class Settings(BaseSettings):
     # reaches the pipeline's threshold; on timeout give the message back (clean
     # NACK_REQUEUE, no fail/DLQ). ---
     gpu_free_mb_ai_human: int = 16000
-    gpu_free_mb_viton: int = 24000
+    gpu_free_mb_viton: int = 28672
     gpu_settle_seconds: float = 30.0
     gpu_wait_interval: float = 15.0
     gpu_wait_timeout: float = 3600.0
@@ -167,6 +170,8 @@ class Settings(BaseSettings):
             )
         # The runner scripts locate the ML trees through these (single source:
         # the .env / compose already carry the VT_ values).
+        env["VT_QWEN_MODEL_DIR"] = str(self.qwen_model_dir)
+        env["VT_ACCESSORY_LORA_PATH"] = str(self.accessory_lora_path)
         env["VT_CONDA_ENV"] = self.conda_env
         env["VT_AI_HUMAN_DIR"] = str(self.ai_human_dir)
         env["VT_REFTON_DIR"] = str(self.refton_dir)

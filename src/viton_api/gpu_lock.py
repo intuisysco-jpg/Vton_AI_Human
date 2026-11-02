@@ -23,6 +23,10 @@ from pathlib import Path
 logger = logging.getLogger("viton_api.gpu_lock")
 
 
+class GpuWaitCancelled(Exception):
+    """Cancellation requested before the shared GPU lease was acquired."""
+
+
 class GpuLease:
     """Exclusive flock over the GPU lock file for the duration of a stage.
 
@@ -50,28 +54,27 @@ class GpuLease:
     def acquired(self) -> bool:
         return self._fd is not None
 
-    async def acquire(self) -> None:
+    async def acquire(self, cancel_check=None) -> None:
         """Take LOCK_EX. If ``gpu_lock_timeout > 0`` poll non-blockingly and
-        raise ``TimeoutError`` if not acquired in time; otherwise block (in a
-        worker thread so the event loop stays responsive)."""
+        raise ``TimeoutError`` if not acquired in time; otherwise poll without a
+        deadline. Cancellation closes the descriptor without leaving a blocked
+        flock thread behind."""
         self.path.parent.mkdir(parents=True, exist_ok=True)
         fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o644)
         try:
-            if self.timeout and self.timeout > 0:
-                deadline = time.monotonic() + self.timeout
-                while True:
-                    try:
-                        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                        break
-                    except BlockingIOError:
-                        if time.monotonic() >= deadline:
-                            raise TimeoutError(
-                                f"GPU lock not acquired within {self.timeout:.0f}s"
-                            )
-                        await asyncio.sleep(self.poll_interval)
-            else:
-                # Blocking flock off-thread so heartbeats / cancel polls keep running.
-                await asyncio.to_thread(fcntl.flock, fd, fcntl.LOCK_EX)
+            deadline = time.monotonic() + self.timeout if self.timeout > 0 else float("inf")
+            while True:
+                if cancel_check is not None and await cancel_check():
+                    raise GpuWaitCancelled()
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError(
+                            f"GPU lock not acquired within {self.timeout:.0f}s"
+                        )
+                    await asyncio.sleep(self.poll_interval)
         except BaseException:
             os.close(fd)
             raise

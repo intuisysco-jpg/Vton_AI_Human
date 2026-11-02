@@ -20,6 +20,7 @@ from __future__ import annotations
 from .fencing import fenced, attempt_path
 
 import asyncio
+from contextvars import ContextVar
 import json
 import logging
 from functools import partial
@@ -34,7 +35,7 @@ from pathlib import Path
 import aio_pika
 
 from .config import Settings, dlq_name_for
-from .gpu_lock import GpuLease
+from .gpu_lock import GpuLease, GpuWaitCancelled
 from .models import (
     EXIT_OOM,
     EXIT_POISON,
@@ -61,6 +62,8 @@ class MissingInputError(Exception):
     message and the message goes straight to the DLQ — never a retry loop.
     """
 
+
+_DELIVERY_DEADLINE = ContextVar("viton_delivery_deadline", default=None)
 
 class AckDecision(str, Enum):
     ACK = "ack"
@@ -300,13 +303,23 @@ class RabbitConsumer:
             # (global_=False) the channel no longer enforces the single-unacked
             # invariant, so this lock does. A second delivered message just
             # waits here in worker memory (broker sees <=2 unacked).
-            async with self._job_lock:
-                if self._stop_requested or (
-                    connection is not None and connection is not self._connection
-                ):
-                    decision = AckDecision.NACK_REQUEUE
-                else:
-                    decision = await self._handle_message(message)
+            deadline = asyncio.get_running_loop().time() + 6900
+            async with asyncio.timeout_at(deadline) as wait_budget:
+                async with self._job_lock:
+                    wait_budget.reschedule(None)
+                    if self._stop_requested or (
+                        connection is not None and connection is not self._connection
+                    ):
+                        decision = AckDecision.NACK_REQUEUE
+                    else:
+                        token = _DELIVERY_DEADLINE.set(deadline)
+                        try:
+                            decision = await self._handle_message(message)
+                        finally:
+                            _DELIVERY_DEADLINE.reset(token)
+        except TimeoutError:
+            logger.warning("Delivery deadline reached; preserving outputs and requeueing")
+            decision = AckDecision.NACK_REQUEUE
         except Exception as e:  # noqa: BLE001 — never let the consumer task die
             logger.error("Message processing interrupted: %s", type(e).__name__)
             decision = AckDecision.NACK_REQUEUE
@@ -424,6 +437,16 @@ class JobProcessor:
     # ------------------------------------------------------------------ #
     @fenced
     async def process(self, reference: str, job_type: str) -> AckDecision:
+        # Catch the deadline INSIDE fencing so the normal requeue path releases
+        # the attempt token instead of leaving a live lease on the next delivery.
+        try:
+            async with asyncio.timeout_at(_DELIVERY_DEADLINE.get()):
+                return await self._process_job(reference, job_type)
+        except TimeoutError:
+            logger.warning("Delivery budget exhausted for %s", reference)
+            return AckDecision.NACK_REQUEUE
+
+    async def _process_job(self, reference: str, job_type: str) -> AckDecision:
         # 1. supported job_type?
         if job_type not in SUPPORTED_JOB_TYPES:
             return await self._reject_unimplemented(reference, job_type)
@@ -568,7 +591,9 @@ class JobProcessor:
             #    free-memory gate (run_tryon.sh §2.5 ordering). Lease-busy or a
             #    gate timeout is a CLEAN requeue — busyness is not a job error.
             try:
-                await lease.acquire()
+                await lease.acquire(cancel_check=lambda: self.store.is_cancel_requested(job_id))
+            except GpuWaitCancelled:
+                raise JobCancelled()
             except TimeoutError:
                 logger.info("reference %s: GPU lease busy -> NACK_REQUEUE", reference)
                 return AckDecision.NACK_REQUEUE

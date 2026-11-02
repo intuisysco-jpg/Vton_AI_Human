@@ -289,6 +289,9 @@ class Orchestrator:
                 if deadline is not None and time.monotonic() >= deadline:
                     await self._terminate_proc(proc, spec, f"TIMEOUT after {timeout}s")
                     raise StageFailed(spec.key, f"timed out after {timeout}s; see job.log")
+        except BaseException:
+            await self._terminate_proc(proc, spec, "stage interrupted")
+            raise
         finally:
             if not pump_task.done():
                 pump_task.cancel()

@@ -98,26 +98,29 @@ class AiHumanStage(StageSpec):
 
 
 class VitonStage(StageSpec):
-    """Virtual try-on (FLUX.1-Kontext + LoRA in RefTon/inference.py, VOSR2 4x)."""
+    """Qwen 2.1 clothing and accessory inference; native PNG outputs."""
     key = "viton"
-    runner_script = "refton_runner.py"
-    env_attr = "conda_env"
-    tree_attr = "refton_dir"  # cwd = RefTon/ (relative model/LoRA paths!)
+    runner_script = "qwen_tryon_runner.py"
+    tree_attr = "service_root"
     probe_imports = (
-        "import sys; sys.path.insert(0, '.'); "
-        "from refton.pipelines import FluxKontextPipelineI2I; "
+        "from diffusers import QwenImage21Pipeline; "
+        "from diffsynth.pipelines.qwen_image_21 import QwenImage21Pipeline as AccessoryPipeline; "
         "import torch; assert torch.cuda.is_available(), 'CUDA unavailable'"
     )
 
     def extra_probe_paths(self, settings: Settings) -> list[Path]:
-        base = Path(settings.refton_dir)
-        return [
-            base / "inference.py",
-            base / "models" / "FLUX.1-Kontext-dev",
-            base / "checkpoints" / "1024_768_pytorch_lora_weights.safetensors",
-            Path(settings.vosr_dir) / "inference_vosr_onestep.py",
-            Path(settings.vosr_dir) / "preset" / "ckpts" / "VOSR2",
-        ]
+        base = settings.qwen_model_dir
+        paths = [base / "model_index.json", base / "scheduler/scheduler_config.json",
+                 base / "processor/preprocessor_config.json", base / "processor/tokenizer.json",
+                 base / "vae/diffusion_pytorch_model.safetensors", settings.accessory_lora_path]
+        for folder, index in (("transformer", "diffusion_pytorch_model.safetensors.index.json"),
+                              ("text_encoder", "model.safetensors.index.json")):
+            manifest = base / folder / index
+            paths.append(manifest)
+            if manifest.is_file():
+                data = json.loads(manifest.read_text())
+                paths.extend(base / folder / name for name in set(data["weight_map"].values()))
+        return paths
 
 
 STAGES: list[StageSpec] = [AiHumanStage(), VitonStage()]
