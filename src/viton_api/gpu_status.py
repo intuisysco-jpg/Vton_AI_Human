@@ -14,12 +14,19 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import socket
 from datetime import datetime, timezone
 
 from .config import Settings
 
 logger = logging.getLogger("viton_api.gpu_status")
+
+
+def gpu_status_id() -> str:
+    """gpu_status row key: GPU_STATUS_ID when set (one row per worker service
+    sharing a GPU), else the legacy ``<hostname>:0``."""
+    return os.environ.get("GPU_STATUS_ID", "").strip() or f"{socket.gethostname()}:0"
 
 
 class GpuStatusReporter:
@@ -43,7 +50,7 @@ class GpuStatusReporter:
             pynvml.nvmlInit()
             self._handle = pynvml.nvmlDeviceGetHandleByIndex(0)
             self._nvml_ok = True
-            logger.info("NVML initialised; gpu_id=%s:0", socket.gethostname())
+            logger.info("NVML initialised; gpu_id=%s", gpu_status_id())
         except Exception as e:  # noqa: BLE001 — any NVML failure is non-fatal
             self._nvml_ok = False
             self._handle = None
@@ -67,7 +74,7 @@ class GpuStatusReporter:
                 pass
 
     async def _beat_once(self) -> None:
-        gpu_id = f"{socket.gethostname()}:0"
+        gpu_id = gpu_status_id()
         current_job = getattr(self.app.state, "current_job", None)
 
         if not self._nvml_ok:

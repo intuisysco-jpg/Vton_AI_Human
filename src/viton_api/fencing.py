@@ -8,10 +8,17 @@ from contextlib import asynccontextmanager, suppress
 from contextvars import ContextVar
 import functools
 import json
+import logging
 import uuid
 
 attempts = ContextVar("worker_attempts", default={})
 references = ContextVar("worker_references", default={})
+log = logging.getLogger(__name__)
+
+# The central coordinator's recover_leases reclaims a job once lease_until
+# passes, so renew well inside the lease (several misses fit before expiry).
+LEASE_SECONDS = 90
+RENEW_SECONDS = 20
 
 
 def attempt_path(reference):
@@ -58,11 +65,9 @@ def fenced(function):
                     job = await conn.fetchrow(
                         "SELECT * FROM jobs WHERE reference=$1 FOR UPDATE", reference
                     )
-                    if (
-                        not job
-                        or job["status"] in {"completed", "cancelled"}
-                        or (job["status"] == "failed" and job["completed_at"])
-                    ):
+                    # Any terminal status drops a duplicate or late delivery:
+                    # its items already carry outcomes, so a rerun only burns GPU.
+                    if not job or job["status"] in {"completed", "cancelled", "failed"}:
                         continue
                     if job["attempt_token"] and await conn.fetchval(
                         "SELECT $1::timestamptz>now()", job["lease_until"]
@@ -73,7 +78,7 @@ def fenced(function):
                         "SELECT set_config('app.coordinator','yes',true)"
                     )
                     await conn.execute(
-                        "UPDATE jobs SET attempt_token=$2,lease_until=now()+interval '90 seconds' WHERE id=$1",
+                        f"UPDATE jobs SET attempt_token=$2,lease_until=now()+interval '{LEASE_SECONDS} seconds' WHERE id=$1",
                         job["id"],
                         uuid.UUID(token),
                     )
@@ -88,20 +93,22 @@ def fenced(function):
 
         async def renew():
             while True:
-                await asyncio.sleep(20)
-                try:
-                    for job_id, token in owned.items():
+                await asyncio.sleep(RENEW_SECONDS)
+                for job_id, token in owned.items():
+                    try:
                         result = await raw.execute(
-                            "UPDATE jobs SET lease_until=now()+interval '90 seconds' WHERE id=$1 AND attempt_token=$2 AND lease_until>now()",
+                            f"UPDATE jobs SET lease_until=now()+interval '{LEASE_SECONDS} seconds' WHERE id=$1 AND attempt_token=$2 AND lease_until>now()",
                             uuid.UUID(job_id),
                             uuid.UUID(token),
                         )
-                        if result != "UPDATE 1":
-                            lost.set()
-                            return
-                except Exception:
-                    lost.set()
-                    return
+                    except Exception as e:
+                        # A DB blip must not end renewal: the lease would lapse
+                        # and the coordinator would re-dispatch a running job.
+                        log.warning("lease renewal failed for %s: %s", job_id, type(e).__name__)
+                        continue
+                    if result != "UPDATE 1":
+                        lost.set()
+                        return
 
         heartbeat = asyncio.create_task(renew())
         try:
