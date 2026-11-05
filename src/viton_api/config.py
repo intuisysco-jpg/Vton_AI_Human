@@ -72,7 +72,7 @@ class Settings(BaseSettings):
 
     # --- per-pipeline base stage timeouts (seconds) ---
     timeout_ai_human: int = 900
-    timeout_ai_model: int = 900
+    timeout_ai_model: int = 2400
     timeout_viton: int = 3600
 
     # Proportional wall-clock backstop (the hang ceiling; the stall probe is
@@ -81,7 +81,7 @@ class Settings(BaseSettings):
     # never force-redelivers a message this worker is still working on.
     stage_per_image_s_ai_human: float = 60.0
     # Measured ~80 s/image on an idle GPU + headroom for QC-driven retries.
-    stage_per_image_s_ai_model: float = 240.0
+    stage_per_image_s_ai_model: float = 600.0
     stage_per_image_s_viton: float = 240.0
     stage_load_overhead_s: float = 600.0
     stage_backstop_hard_cap_s: float = 6900.0
