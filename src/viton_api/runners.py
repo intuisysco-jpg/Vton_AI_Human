@@ -75,7 +75,10 @@ class StageSpec:
 
     def build_cmd(self, ctx: StageContext) -> list[str]:
         job_json = ctx.job_json or ctx.write_job_json()
-        return ctx.settings.conda_command("python", self._script(ctx), "--job-json", str(job_json))
+        env = getattr(ctx.settings, self.env_attr)
+        return ctx.settings.conda_command_for(
+            env, "python", self._script(ctx), "--job-json", str(job_json)
+        )
 
 
 class AiHumanStage(StageSpec):
@@ -97,14 +100,50 @@ class AiHumanStage(StageSpec):
         ]
 
 
+class AiModelStage(StageSpec):
+    """Image-to-image AI human (new/ai_model/pipeline.py, env `aimodel`).
+
+    Pose-preserving face/hair replacement: Qwen3-VL analysis -> routing ->
+    SAM3 segmentation -> FLUX.2-Klein masked inpaint (weights shared with the
+    ai_human tree) -> blend -> QC. The runner imports pipeline.process
+    in-process; the pipeline shells out per GPU step itself.
+    """
+    key = "ai_model"
+    runner_script = "ai_model_runner.py"
+    env_attr = "aimodel_env"   # own conda env, not the shared conda_env
+    tree_attr = "ai_model_dir"  # cwd = new/ai_model/ (pipeline.py import root)
+    probe_imports = (
+        "import sys; sys.path.insert(0, '.'); import pipeline; "
+        "import torch; assert torch.cuda.is_available(), 'CUDA unavailable'"
+    )
+
+    def extra_probe_paths(self, settings: Settings) -> list[Path]:
+        base = Path(settings.ai_model_dir)
+        return [
+            base / "pipeline.py",
+            base / "models" / "yunet",
+            base / "models" / "sface",
+            # Default backend reuses the FLUX.2-Klein weights from the sibling
+            # ai_human tree (config.FLUX_LOCAL_DIR in the pipeline).
+            Path(settings.ai_human_dir) / "models" / "FLUX.2-klein-4B",
+        ]
+
+
 class VitonStage(StageSpec):
-    """Qwen 2.1 clothing and accessory inference; native PNG outputs."""
+    """Qwen 2.1 clothing and accessory inference; native PNG outputs.
+
+    Accessory mode shells out to the audited crop-context implementation
+    (try_on_gar/run_accessory_tryon.py): MediaPipe landmarks + Qwen 2.1 crop
+    generation, LoRA off. Its heavy imports (cv2, mediapipe, diffsynth) and
+    landmark .task files are therefore part of this stage's readiness.
+    """
     key = "viton"
     runner_script = "qwen_tryon_runner.py"
     tree_attr = "service_root"
     probe_imports = (
         "from diffusers import QwenImage21Pipeline; "
         "from diffsynth.pipelines.qwen_image_21 import QwenImage21Pipeline as AccessoryPipeline; "
+        "import mediapipe; import cv2; "
         "import torch; assert torch.cuda.is_available(), 'CUDA unavailable'"
     )
 
@@ -112,7 +151,15 @@ class VitonStage(StageSpec):
         base = settings.qwen_model_dir
         paths = [base / "model_index.json", base / "scheduler/scheduler_config.json",
                  base / "processor/preprocessor_config.json", base / "processor/tokenizer.json",
-                 base / "vae/diffusion_pytorch_model.safetensors", settings.accessory_lora_path]
+                 base / "vae/diffusion_pytorch_model.safetensors",
+                 settings.accessory_script,
+                 # Crop-context (the default) never loads the LoRA; probe it only
+                 # when the legacy full mode is selected.
+                 settings.mediapipe_dir / "pose_landmarker_full.task",
+                 settings.mediapipe_dir / "hand_landmarker.task",
+                 settings.mediapipe_dir / "face_landmarker.task"]
+        if settings.accessory_mode == "full":
+            paths.append(settings.accessory_lora_path)
         for folder, index in (("transformer", "diffusion_pytorch_model.safetensors.index.json"),
                               ("text_encoder", "model.safetensors.index.json")):
             manifest = base / folder / index
@@ -123,5 +170,5 @@ class VitonStage(StageSpec):
         return paths
 
 
-STAGES: list[StageSpec] = [AiHumanStage(), VitonStage()]
+STAGES: list[StageSpec] = [AiHumanStage(), AiModelStage(), VitonStage()]
 STAGE_BY_KEY: dict[str, StageSpec] = {s.key: s for s in STAGES}

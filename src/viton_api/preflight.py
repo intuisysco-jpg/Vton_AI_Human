@@ -79,7 +79,7 @@ class Preflight:
                 logger.info(
                     "preflight %s env=%s available=%s %s",
                     spec.key,
-                    self.settings.conda_env,
+                    getattr(self.settings, getattr(spec, "env_attr", "conda_env")),
                     ok,
                     reasons[spec.key],
                 )
@@ -90,7 +90,12 @@ class Preflight:
             return dict(availability)
 
     async def _probe_stage(self, spec) -> tuple[bool, str]:
-        command = self.settings.conda_command("python", "-c", spec.probe_imports)
+        command = self.settings.conda_command_for(
+            getattr(self.settings, getattr(spec, "env_attr", "conda_env")),
+            "python",
+            "-c",
+            spec.probe_imports,
+        )
         try:
             proc = await asyncio.create_subprocess_exec(
                 *command,

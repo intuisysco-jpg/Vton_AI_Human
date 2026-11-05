@@ -3,6 +3,12 @@
 
 Keeps the verified model settings, but consumes explicit ordinal pairs rather
 than folder Cartesian products. One selected pipeline is loaded per job.
+
+Clothing keeps the diffusers Qwen 2.1 pipeline in-process. Accessory jobs
+shell out per unit to the audited crop-context implementation
+(qwen21_tryon_test/try_on_gar/run_accessory_tryon.py: MediaPipe landmark
+placement + Qwen 2.1 crop generation, LoRA off) and translate its artifacts
+and exit codes back into this runner's JSONL/exit-code contract.
 """
 
 from __future__ import annotations
@@ -10,6 +16,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
+import subprocess
 import sys
 import traceback
 from pathlib import Path
@@ -24,6 +32,28 @@ GARMENT_TYPE_PROMPTS = {
     "outerwear": "The garment in image 2 is OUTERWEAR (jacket, coat, hoodie, blazer, or similar). Put it on over the person's current outfit as the outermost layer. ",
 }
 CUSTOM_TEMPLATE = "Edit Image 1 so the person wears the {category} shown in Image 2. Preserve the product's design, color, material, and proportions. Place it naturally with appropriate scale and occlusion. Keep the person's identity, pose, existing clothing, and background unchanged."
+
+_RUNNER_DIR = Path(__file__).resolve().parent
+_DEFAULT_ACCESSORY_SCRIPT = (
+    _RUNNER_DIR.parent.parent
+    / "qwen21_tryon_test/try_on_gar/run_accessory_tryon.py"
+)
+# Human-readable attachment instructions are advisory under the crop-context
+# implementation: it builds its own placement-aware prompt per category.
+_ACCESSORY_COMPOSITE = "10_final_composite.png"
+_ACCESSORY_META = "meta.json"
+
+
+class UnitFailure(Exception):
+    """This person/accessory pair cannot be processed; remaining pairs continue."""
+
+
+class PoisonJobError(Exception):
+    """The job itself is invalid (e.g. unsupported category); fail fast."""
+
+
+class ResourceWaitError(Exception):
+    """GPU/RAM pressure; the orchestrator should clean-requeue the delivery."""
 
 
 def emit(event, **fields):
@@ -54,36 +84,142 @@ def load_pipeline(mode, model, lora):
             tile_sample_stride_width=448,
         )
     else:
-        from diffsynth.pipelines.qwen_image_21 import ModelConfig, QwenImage21Pipeline
-
-        configs = []
-        for pattern in (
-            "transformer/diffusion_pytorch_model*.safetensors",
-            "text_encoder/model*.safetensors",
-            "vae/diffusion_pytorch_model.safetensors",
-        ):
-            paths = sorted(model.glob(pattern))
-            if not paths:
-                raise FileNotFoundError(f"No weights matching {pattern}")
-            configs.append(
-                ModelConfig(
-                    path=[str(p) for p in paths] if len(paths) > 1 else str(paths[0]),
-                    offload_device="cpu",
-                    offload_dtype=torch.bfloat16,
-                )
-            )
-        pipe = QwenImage21Pipeline.from_pretrained(
-            torch_dtype=torch.bfloat16,
-            device="cuda",
-            model_configs=configs,
-            vram_limit=24.0,
-            processor_config=ModelConfig(path=str(model / "processor")),
-        )
-        pipe.load_lora(pipe.dit, str(lora))
+        # The accessory implementation loads its own pipeline per invocation
+        # (subprocess per unit); there is no shared in-process pipeline.
+        return None
     return pipe
 
 
-def infer(pipe, params, person, product):
+def _visible_device_index() -> str:
+    """Explicit CUDA index for CUDA_VISIBLE_DEVICES (the script's GPU gate).
+
+    The crop-context script refuses to generate unless CUDA_VISIBLE_DEVICES
+    names explicit valid indices, so derive one from VT_DEVICE (default cuda:0).
+    """
+    device = os.environ.get("VT_DEVICE", "cuda:0")
+    digits = "".join(ch for ch in device.split(":")[-1] if ch.isdigit())
+    return digits or "0"
+
+
+def _spawn_accessory(cmd, env, cwd):
+    """Run the accessory script, streaming its output through our stdout.
+
+    Streaming (not capture-then-print) keeps the orchestrator's multi-signal
+    stall detector fed during long generation phases. Returns the exit code
+    and the combined transcript for post-mortem OOM detection.
+    """
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        env=env,
+        cwd=cwd,
+    )
+    transcript = []
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        transcript.append(line)
+        print(f"[accessory] {line.rstrip()}", flush=True)
+    proc.wait()
+    return proc.returncode, "".join(transcript)
+
+
+def run_accessory_script(params, unit, out_dir):
+    """Drive try_on_gar/run_accessory_tryon.py for one (person, accessory) pair.
+
+    Exit-code contract of the script: 0 ok | 1 prepare failed | 2 GPU gate
+    refused | 3 unsupported category | 4 landmarks needs-input | 5 preservation
+    rejected | 6 sam3 check failed. Success artifact: 10_final_composite.png
+    (full person, native resolution) + meta.json with status "ok".
+    """
+    script = Path(os.environ.get("VT_ACCESSORY_SCRIPT") or _DEFAULT_ACCESSORY_SCRIPT)
+    mode = os.environ.get("VT_ACCESSORY_MODE", "crop-context")
+    category = params["accessory_category"].strip()
+    if params.get("contact_sentence"):
+        print(
+            "note: contact_sentence is advisory under the crop-context "
+            "implementation and is not sent to the model: "
+            f"{params['contact_sentence']!r}",
+            flush=True,
+        )
+    # The script never overwrites an output dir: _fresh_dir() bumps the name
+    # (suffix _1, _2, ...) whenever the path exists — including an empty dir.
+    # So clean any stale scratch but do NOT create it; the passed path must be
+    # non-existent for the script to use it verbatim (harvest relies on that).
+    scratch = Path(out_dir) / f"accessory_{unit['ordinal']:04d}"
+    if scratch.exists():
+        shutil.rmtree(scratch)
+    env = dict(os.environ)
+    env["CUDA_VISIBLE_DEVICES"] = _visible_device_index()
+    env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+    cmd = [
+        sys.executable,
+        str(script),
+        "--mode",
+        mode,
+        "--person",
+        str(unit["person"]),
+        "--accessory",
+        str(unit["garment"]),
+        "--category",
+        category,
+        "--output-dir",
+        str(scratch),
+    ]
+    print(f"[accessory] launching: {' '.join(cmd)}", flush=True)
+    code, transcript = _spawn_accessory(cmd, env, str(script.parent))
+    lowered = transcript.lower()
+    if "out of memory" in lowered or "outofmemoryerror" in lowered:
+        raise ResourceWaitError("accessory script reported CUDA OOM")
+    if code == 0:
+        composite = scratch / _ACCESSORY_COMPOSITE
+        meta_path = scratch / _ACCESSORY_META
+        if not composite.is_file():
+            raise UnitFailure(
+                f"accessory script exited 0 but {_ACCESSORY_COMPOSITE} is missing"
+            )
+        try:
+            meta = json.loads(meta_path.read_text()) if meta_path.is_file() else {}
+        except ValueError:
+            meta = {}
+        if str(meta.get("status", "ok")).lower() != "ok":
+            raise UnitFailure(
+                f"accessory script exited 0 but meta status is {meta.get('status')!r}"
+            )
+        from PIL import Image
+
+        with Image.open(composite) as result:
+            result.load()  # detach from the scratch dir before cleanup
+            image = result.copy()
+        shutil.rmtree(scratch, ignore_errors=True)
+        return image
+    if code == 4:
+        raise UnitFailure(
+            "needs-input: MediaPipe could not place the accessory on this "
+            "person photo (landmark detection failed; a closer photo may help)"
+        )
+    if code == 5:
+        raise UnitFailure(
+            "rejected: preservation/quality checks failed for this pair"
+        )
+    if code == 1:
+        raise UnitFailure("prepare failed: invalid person/accessory image")
+    if code == 3:
+        emit(
+            "fatal_poison",
+            error=(
+                f"unsupported accessory category {category!r} for the "
+                "crop-context implementation"
+            ),
+        )
+        raise PoisonJobError(category)
+    if code == 2:
+        raise ResourceWaitError("accessory script GPU gate refused to run")
+    raise RuntimeError(f"accessory script exited with unexpected code {code}")
+
+
+def infer(pipe, params, person, product, unit=None, out_dir=None):
     mode = params.get("tryon_mode", "clothing")
     if mode == "clothing":
         import torch
@@ -102,28 +238,9 @@ def infer(pipe, params, person, product):
             num_images_per_prompt=1,
             generator=torch.Generator(device="cuda").manual_seed(42),
         ).images[0]
-    from diffsynth.core.data.operators import ImageCropAndResize
-
-    for im in (person, product):
-        if max(im.size) > 2048:
-            from PIL import Image
-
-            im.thumbnail((2048, 2048), Image.Resampling.LANCZOS)
-    person = ImageCropAndResize(
-        max_pixels=1048576, height_division_factor=32, width_division_factor=32
-    )(person)
-    prompt = CUSTOM_TEMPLATE.format(category=params["accessory_category"].strip())
-    if params.get("contact_sentence"):
-        prompt += " " + params["contact_sentence"].strip()
-    return pipe(
-        prompt,
-        edit_image=[person, product],
-        seed=0,
-        num_inference_steps=40,
-        cfg_scale=1.0,
-        height=person.height,
-        width=person.width,
-    )
+    if unit is None or out_dir is None:
+        raise UnitFailure("accessory mode requires unit paths (unit/out_dir)")
+    return run_accessory_script(params, unit, out_dir)
 
 
 def run(job, loader=load_pipeline, generate=infer):
@@ -161,7 +278,7 @@ def run(job, loader=load_pipeline, generate=infer):
         try:
             if pipe is None:
                 pipe = loader(mode, model, lora)
-            image = generate(pipe, params, person, product)
+            image = generate(pipe, params, person, product, unit, out)
             dest = out / f"{ordinal:04d}.png"
             temporary = out / f"{ordinal:04d}.partial.png"
             image.save(temporary, format="PNG")
@@ -172,6 +289,17 @@ def run(job, loader=load_pipeline, generate=infer):
             temporary.replace(dest)
             emit("image_done", ordinal=ordinal, path=str(dest))
             done += 1
+        except UnitFailure as exc:
+            # One bad pair (needs-input / rejected / invalid input) must not
+            # sink the remaining pairs in the batch.
+            emit("image_failed", ordinal=ordinal, error=str(exc))
+            continue
+        except PoisonJobError:
+            # fatal_poison was already emitted by the helper.
+            return 2
+        except ResourceWaitError as exc:
+            emit("resource_wait", error=str(exc))
+            return 3
         except Exception as exc:  # noqa: BLE001 -- translate ML failures into runner exit codes
             traceback.print_exc()
             if (

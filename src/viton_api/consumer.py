@@ -44,6 +44,7 @@ from .models import (
     image_pct,
     parse_params,
     validate_ai_human_params,
+    validate_ai_model_params,
     validate_viton_params,
 )
 from .orchestrator import JobCancelled, Orchestrator, StageFailed
@@ -467,6 +468,8 @@ class JobProcessor:
         params = parse_params(job.get("params"))
         if job_type == "ai_human":
             err = validate_ai_human_params(params)
+        elif job_type == "ai_model":
+            err = validate_ai_model_params(params)
         else:
             err = validate_viton_params(params)
         if err:
@@ -492,13 +495,33 @@ class JobProcessor:
 
         ai_human: text mode has ZERO input rows (legal) — units are synthesized
         from jobs.image_count. Reference rows (role='reference') attach per
-        ordinal. viton: every ordinal MUST have both 'person' and 'garment'.
+        ordinal. ai_model: every ordinal MUST have a 'person' row (the photo
+        whose identity is replaced). viton: every ordinal MUST have both
+        'person' and 'garment'.
         """
         job_id = job["id"]
         inputs = await self.store.get_input_files(job_id)
         by_ordinal: dict[int, dict[str, dict]] = {}
         for row in inputs:
             by_ordinal.setdefault(int(row.get("ordinal") or 0), {})[row["role"]] = row
+
+        if job_type == "ai_model":
+            image_count = int(job.get("image_count") or 0)
+            if not by_ordinal:
+                raise _PoisonError("ai_model job with no person inputs")
+            if image_count > 0 and len(by_ordinal) > image_count:
+                raise _PoisonError("more person rows than image_count")
+            units = []
+            for ordinal in sorted(by_ordinal):
+                person = by_ordinal[ordinal].get("person")
+                if person is None:
+                    raise _PoisonError(f"ordinal {ordinal} missing person input")
+                units.append(Unit(
+                    ordinal=ordinal,
+                    original_filename=person["original_filename"],
+                    person_rel=person["file_path"],
+                ))
+            return units
 
         if job_type == "ai_human":
             image_count = int(job.get("image_count") or 0)

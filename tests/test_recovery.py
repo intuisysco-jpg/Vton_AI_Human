@@ -47,18 +47,19 @@ def test_one_environment_drives_probes_runners_and_child_environment(
     monkeypatch.setenv("VT_AI_HUMAN_DIR", "old-tree")
     env = config.conda_subprocess_env()
     assert env["VT_CONDA_ENV"] == "qwen21"
+    assert env["VT_AIMODEL_ENV"] == "aimodel"
     assert env["VT_AI_HUMAN_DIR"] == str(config.ai_human_dir)
+    assert env["VT_AI_MODEL_DIR"] == str(config.ai_model_dir)
     assert env["VT_VOSR_DIR"] == str(config.vosr_dir)
+    # Every stage pins its own env: ai_human/viton share conda_env (qwen21),
+    # ai_model runs in aimodel.
     context = StageContext.for_job(tmp_path, "test-job", {}, [], config)
+    expected_env = {"ai_human": "qwen21", "ai_model": "aimodel", "viton": "qwen21"}
     for stage in STAGES:
-        assert stage.build_cmd(context)[:6] == [
-            "conda",
-            "run",
-            "--no-capture-output",
-            "-n",
-            "qwen21",
-            "python",
-        ]
+        cmd = stage.build_cmd(context)
+        assert cmd[:4] == ["conda", "run", "--no-capture-output", "-n"]
+        assert cmd[4] == expected_env[stage.key]
+        assert cmd[5] == "python"
 
 
 def test_diagnostics_redact_secrets():
@@ -74,8 +75,8 @@ def test_diagnostics_redact_secrets():
 async def test_cached_readiness_requires_actual_subscriptions(monkeypatch):
     config = settings()
     check = Preflight(config)
-    check.availability = {"ai_human": True, "viton": True}
-    check.reasons = {"ai_human": "", "viton": ""}
+    check.availability = {"ai_human": True, "ai_model": True, "viton": True}
+    check.reasons = {"ai_human": "", "ai_model": "", "viton": ""}
     check.probe_all = AsyncMock(side_effect=AssertionError("health polled preflight"))
     consumer = SimpleNamespace(
         broker_connected=True, connected=False, last_error="Subscription pending"
@@ -104,7 +105,11 @@ async def test_cached_readiness_requires_actual_subscriptions(monkeypatch):
 
 def fake_stages(tmp_path):
     output = []
-    for key, tree in (("ai_human", "ai_human_dir"), ("viton", "refton_dir")):
+    for key, tree in (
+        ("ai_human", "ai_human_dir"),
+        ("ai_model", "ai_model_dir"),
+        ("viton", "refton_dir"),
+    ):
         (tmp_path / f"{key}.py").touch()
         output.append(
             SimpleNamespace(
@@ -120,7 +125,12 @@ def fake_stages(tmp_path):
 async def test_preflight_serializes_and_coalesces_overlapping_checks(
     tmp_path, monkeypatch
 ):
-    config = settings(runners_dir=tmp_path, ai_human_dir=tmp_path, refton_dir=tmp_path)
+    config = settings(
+        runners_dir=tmp_path,
+        ai_human_dir=tmp_path,
+        ai_model_dir=tmp_path,
+        refton_dir=tmp_path,
+    )
     check = Preflight(config)
     monkeypatch.setattr(preflight_module, "STAGES", fake_stages(tmp_path))
     active = maximum = calls = 0
@@ -136,8 +146,11 @@ async def test_preflight_serializes_and_coalesces_overlapping_checks(
 
     monkeypatch.setattr(check, "_probe_stage", probe)
     snapshots = await asyncio.gather(*(check.probe_all() for _ in range(3)))
-    assert calls == 2 and maximum == 1
-    assert all(snapshot == {"ai_human": True, "viton": True} for snapshot in snapshots)
+    assert calls == 3 and maximum == 1
+    assert all(
+        snapshot == {"ai_human": True, "ai_model": True, "viton": True}
+        for snapshot in snapshots
+    )
     assert check.ready
 
 
@@ -147,6 +160,7 @@ async def test_preflight_checks_missing_directory_before_spawning_conda(
     config = settings(
         runners_dir=tmp_path,
         ai_human_dir=tmp_path / "missing",
+        ai_model_dir=tmp_path / "missing",
         refton_dir=tmp_path / "missing",
     )
     check = Preflight(config)
@@ -206,8 +220,15 @@ async def test_supervisor_recovers_preflight_without_recreating_pool(
     async def probe():
         nonlocal calls
         calls += 1
-        check.availability = {"ai_human": calls >= 2, "viton": calls >= 2}
-        check.reasons = {"ai_human": "" if calls >= 2 else "missing environment"}
+        ready = calls >= 2
+        check.availability = {
+            "ai_human": ready, "ai_model": ready, "viton": ready
+        }
+        check.reasons = {
+            "ai_human": "" if ready else "missing environment",
+            "ai_model": "" if ready else "missing environment",
+            "viton": "" if ready else "missing environment",
+        }
 
     monkeypatch.setattr(check, "probe_all", probe)
     pool = SimpleNamespace(fetchval=AsyncMock(return_value=1))

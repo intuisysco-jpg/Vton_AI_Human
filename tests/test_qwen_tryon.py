@@ -287,3 +287,171 @@ def test_allocator_cache_is_released_after_each_success(tmp_path, monkeypatch):
         == 0
     )
     assert empty.call_count == 2
+
+
+# --- accessory mode: the crop-context subprocess adapter ----------------- #
+
+
+def _accessory_env(monkeypatch, tmp_path):
+    monkeypatch.setenv("VT_QWEN_MODEL_DIR", "/models")
+    monkeypatch.setenv("VT_ACCESSORY_LORA_PATH", "/lora")
+    monkeypatch.setenv("VT_ACCESSORY_SCRIPT", str(tmp_path / "run_accessory_tryon.py"))
+    monkeypatch.setenv("VT_ACCESSORY_MODE", "crop-context")
+    monkeypatch.setattr(
+        "psutil.virtual_memory", lambda: SimpleNamespace(available=100 * 1024**3)
+    )
+    Image.new("RGB", (40, 80)).save(tmp_path / "person.png")
+    Image.new("RGB", (20, 20)).save(tmp_path / "accessory.png")
+
+
+def _events(capsys):
+    out = []
+    for line in capsys.readouterr().out.splitlines():
+        try:
+            out.append(json.loads(line))
+        except ValueError:
+            continue  # plain log lines (e.g. "[accessory] ...") are not events
+    return out
+
+
+def _fake_spawn(codes_by_ordinal, meta_status="ok"):
+    """Fake _spawn_accessory: writes success artifacts, returns scripted codes."""
+    calls = []
+
+    def spawn(cmd, env, cwd):
+        calls.append((cmd, env))
+        ordinal = int(Path(cmd[cmd.index("--output-dir") + 1]).name.split("_")[1])
+        scratch = Path(cmd[cmd.index("--output-dir") + 1])
+        scratch.mkdir(parents=True, exist_ok=True)
+        code = codes_by_ordinal.get(ordinal, 0)
+        if code == 0:
+            Image.new("RGB", (40, 80)).save(scratch / "10_final_composite.png")
+            (scratch / "meta.json").write_text(json.dumps({"status": meta_status}))
+        return code, f"fake transcript for {ordinal}\n"
+
+    return spawn, calls
+
+
+def _accessory_units(tmp_path, ordinals):
+    return [
+        {
+            "ordinal": o,
+            "person": str(tmp_path / "person.png"),
+            "garment": str(tmp_path / "accessory.png"),
+        }
+        for o in ordinals
+    ]
+
+
+def test_accessory_success_harvests_composite_and_cleans_scratch(
+    tmp_path, monkeypatch, capsys
+):
+    _accessory_env(monkeypatch, tmp_path)
+    spawn, calls = _fake_spawn({5: 0})
+    monkeypatch.setattr(runner, "_spawn_accessory", spawn)
+    units = _accessory_units(tmp_path, [5])
+    job = {
+        "params": {"tryon_mode": "accessory", "accessory_category": "earring"},
+        "units": units,
+        "output_dir": str(tmp_path / "out"),
+    }
+    assert runner.run(job, lambda *a: None) == 0
+    events = _events(capsys)
+    assert [(e["event"], e["ordinal"]) for e in events] == [("image_done", 5)]
+    # The contract PNG lands in the output dir; the script scratch is removed.
+    assert (tmp_path / "out" / "0005.png").is_file()
+    assert not (tmp_path / "out" / "accessory_0005").exists()
+    # The script is invoked exactly once with the canonical shape.
+    cmd = calls[0][0]
+    assert cmd[cmd.index("--category") + 1] == "earring"
+    assert cmd[cmd.index("--person") + 1] == str(tmp_path / "person.png")
+    assert cmd[cmd.index("--accessory") + 1] == str(tmp_path / "accessory.png")
+    assert cmd[cmd.index("--mode") + 1] == "crop-context"
+    # The child env carries an explicit CUDA device (the script's GPU gate).
+    assert calls[0][1]["CUDA_VISIBLE_DEVICES"] == "0"
+
+
+def test_accessory_needs_input_fails_pair_but_batch_continues(
+    tmp_path, monkeypatch, capsys
+):
+    _accessory_env(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        runner, "_spawn_accessory", _fake_spawn({2: 4, 7: 0})[0]
+    )
+    units = _accessory_units(tmp_path, [2, 7])
+    job = {
+        "params": {"tryon_mode": "accessory", "accessory_category": "nose_pin"},
+        "units": units,
+        "output_dir": str(tmp_path / "out"),
+    }
+    assert runner.run(job, lambda *a: None) == 0
+    events = _events(capsys)
+    assert [(e["event"], e["ordinal"]) for e in events] == [
+        ("image_failed", 2),
+        ("image_done", 7),
+    ]
+    assert "needs-input" in events[0]["error"]
+
+
+def test_accessory_unsupported_category_is_poison(tmp_path, monkeypatch, capsys):
+    _accessory_env(monkeypatch, tmp_path)
+    monkeypatch.setattr(runner, "_spawn_accessory", _fake_spawn({0: 3})[0])
+    job = {
+        "params": {"tryon_mode": "accessory", "accessory_category": "monocle"},
+        "units": _accessory_units(tmp_path, [0]),
+        "output_dir": str(tmp_path / "out"),
+    }
+    assert runner.run(job, lambda *a: None) == 2
+    events = _events(capsys)
+    assert events[0]["event"] == "fatal_poison"
+    assert "monocle" in events[0]["error"]
+
+
+def test_accessory_gpu_gate_refusal_clean_requeues(tmp_path, monkeypatch, capsys):
+    _accessory_env(monkeypatch, tmp_path)
+    monkeypatch.setattr(runner, "_spawn_accessory", _fake_spawn({0: 2})[0])
+    job = {
+        "params": {"tryon_mode": "accessory", "accessory_category": "bangle"},
+        "units": _accessory_units(tmp_path, [0]),
+        "output_dir": str(tmp_path / "out"),
+    }
+    assert runner.run(job, lambda *a: None) == 3
+    assert _events(capsys)[0]["event"] == "resource_wait"
+
+
+def test_accessory_contact_sentence_is_advisory_and_not_forwarded(
+    tmp_path, monkeypatch, capsys
+):
+    _accessory_env(monkeypatch, tmp_path)
+    spawn, calls = _fake_spawn({1: 0})
+    monkeypatch.setattr(runner, "_spawn_accessory", spawn)
+    sentence = "The earring post passes through the earlobe piercing."
+    job = {
+        "params": {
+            "tryon_mode": "accessory",
+            "accessory_category": "earring",
+            "contact_sentence": sentence,
+        },
+        "units": _accessory_units(tmp_path, [1]),
+        "output_dir": str(tmp_path / "out"),
+    }
+    assert runner.run(job, lambda *a: None) == 0
+    plain = capsys.readouterr().out
+    assert "advisory" in plain
+    assert sentence in plain
+    cmd = " ".join(calls[0][0])
+    assert sentence not in cmd  # never reaches the model prompt
+
+
+def test_accessory_non_ok_meta_status_fails_the_pair(tmp_path, monkeypatch, capsys):
+    _accessory_env(monkeypatch, tmp_path)
+    monkeypatch.setattr(runner, "_spawn_accessory", _fake_spawn({0: 0}, meta_status="needs-input")[0])
+    job = {
+        "params": {"tryon_mode": "accessory", "accessory_category": "cap"},
+        "units": _accessory_units(tmp_path, [0]),
+        "output_dir": str(tmp_path / "out"),
+    }
+    assert runner.run(job, lambda *a: None) == 2  # nothing produced
+    events = _events(capsys)
+    assert events[0]["event"] == "image_failed"
+    assert "needs-input" in events[0]["error"]

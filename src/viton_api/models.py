@@ -30,11 +30,12 @@ TERMINAL_STATUSES = {"completed", "cancelled", "failed"}
 # Stages. Each job type is a single runner invocation; one stage runs per job
 # (dispatched by job_type, not a sequence).
 # --------------------------------------------------------------------------- #
-STAGE_KEYS = ("ai_human", "viton")
+STAGE_KEYS = ("ai_human", "ai_model", "viton")
 
 # Progress reported while the single stage runs; 100 is set only on finalize.
 STAGE_PROGRESS = {
     "ai_human": 50,
+    "ai_model": 50,
     "viton": 50,
 }
 
@@ -54,6 +55,7 @@ def image_pct(done: int, n: int) -> int:
 # job_type -> (stage_key, Settings attr for the conda env, Settings attr for the probe cwd tree)
 JOB_TYPE_TO_STAGE = {
     "ai_human": ("ai_human", "conda_env", "ai_human_dir"),
+    "ai_model": ("ai_model", "aimodel_env", "ai_model_dir"),
     "viton": ("viton", "conda_env", "service_root"),
 }
 
@@ -120,6 +122,14 @@ def validate_ai_human_params(params: dict) -> str | None:
         return f"invalid outfit_type {params.get('outfit_type')!r}"
     if params.get("outfit") and params.get("outfit_type"):
         return "provide either 'outfit' or 'outfit_type', not both"
+    seed = params.get("seed", 42)
+    if not isinstance(seed, int) or isinstance(seed, bool) or not (0 <= seed <= 2_147_483_647):
+        return f"invalid seed {seed!r}"
+    return None
+
+
+def validate_ai_model_params(params: dict) -> str | None:
+    """Return an error message for a bad ai_model params dict, else None."""
     seed = params.get("seed", 42)
     if not isinstance(seed, int) or isinstance(seed, bool) or not (0 <= seed <= 2_147_483_647):
         return f"invalid seed {seed!r}"

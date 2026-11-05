@@ -38,21 +38,41 @@ class Settings(BaseSettings):
 
     # --- ML tree directories (where the model weights live; cwd for probes) ---
     ai_human_dir: Path = Field(default=_VITON_ROOT / "ai_human")
+    ai_model_dir: Path = Field(default=_VITON_ROOT / "new" / "ai_model")
     refton_dir: Path = Field(default=_VITON_ROOT / "RefTon")
     vosr_dir: Path = Field(default=_VITON_ROOT / "tools" / "VOSR")
 
     qwen_model_dir: Path = Path("/nvme0n1-disk/cache/huggingface/hub/Qwen_2.1")
     accessory_lora_path: Path = _VITON_ROOT / "qwen21_tryon_test/qwen_lora/models/Garments2Look-LoRA/Qwen-Image-2.1-LoRA-2-refer-97068-editing-epoch-0.safetensors"
 
+    # --- accessory try-on: the audited crop-context implementation
+    # (MediaPipe landmarks + Qwen 2.1 crop generation; LoRA off) is driven as a
+    # per-unit subprocess from runners/qwen_tryon_runner.py. ---
+    accessory_script: Path = _VITON_ROOT / (
+        "qwen21_tryon_test/try_on_gar/run_accessory_tryon.py"
+    )
+    accessory_mode: str = Field(default="crop-context", pattern=r"^(crop-context|full)$")
+    mediapipe_dir: Path = Path("/nvme0n1-disk/cache/mediapipe")
+
     # Shared ML runtime, verified for both pipelines on the GPU server.
     conda_env: str = Field(
         default="qwen21", min_length=1, pattern=r"^[A-Za-z0-9_][A-Za-z0-9_.-]*$"
     )
 
+    # The ai_model pipeline (image-to-image identity replacement) runs in its
+    # own verified env; see AiModelStage.env_attr in runners.py.
+    aimodel_env: str = Field(
+        default="aimodel", min_length=1, pattern=r"^[A-Za-z0-9_][A-Za-z0-9_.-]*$"
+    )
+
+    # QC-driven retry budget inside the pipeline (pipeline.process max_retries).
+    ai_model_max_retries: int = Field(default=2, ge=0, le=5)
+
     device: str = "cuda:0"
 
     # --- per-pipeline base stage timeouts (seconds) ---
     timeout_ai_human: int = 900
+    timeout_ai_model: int = 900
     timeout_viton: int = 3600
 
     # Proportional wall-clock backstop (the hang ceiling; the stall probe is
@@ -60,6 +80,8 @@ class Settings(BaseSettings):
     # The cap MUST stay under RabbitMQ consumer_timeout (7200 s) so the broker
     # never force-redelivers a message this worker is still working on.
     stage_per_image_s_ai_human: float = 60.0
+    # Measured ~80 s/image on an idle GPU + headroom for QC-driven retries.
+    stage_per_image_s_ai_model: float = 240.0
     stage_per_image_s_viton: float = 240.0
     stage_load_overhead_s: float = 600.0
     stage_backstop_hard_cap_s: float = 6900.0
@@ -75,6 +97,7 @@ class Settings(BaseSettings):
     # reaches the pipeline's threshold; on timeout give the message back (clean
     # NACK_REQUEUE, no fail/DLQ). ---
     gpu_free_mb_ai_human: int = 16000
+    gpu_free_mb_ai_model: int = 16000
     gpu_free_mb_viton: int = 28672
     gpu_settle_seconds: float = 30.0
     gpu_wait_interval: float = 15.0
@@ -118,9 +141,9 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("VT_MAX_RETRIES", "MAX_RETRIES"),
     )
 
-    # One consumer per queue; the processor lock serializes both pipelines.
+    # One consumer per queue; the processor lock serializes the pipelines.
     queue_names: list[str] = Field(
-        default_factory=lambda: ["ai_human_queue", "viton_queue"]
+        default_factory=lambda: ["ai_human_queue", "ai_model_queue", "viton_queue"]
     )
 
     # ------------------------------------------------------------------ #
@@ -131,22 +154,29 @@ class Settings(BaseSettings):
 
     def conda_command(self, *arguments: str) -> list[str]:
         """Use one environment selection for probes and actual inference."""
-        return ["conda", "run", "--no-capture-output", "-n", self.conda_env, *arguments]
+        return self.conda_command_for(self.conda_env, *arguments)
+
+    def conda_command_for(self, env: str, *arguments: str) -> list[str]:
+        """`conda run` under an explicit env (stages may pin their own)."""
+        return ["conda", "run", "--no-capture-output", "-n", env, *arguments]
 
     def gpu_free_mb_for(self, job_type: str) -> int:
-        return (
-            self.gpu_free_mb_viton if job_type == "viton" else self.gpu_free_mb_ai_human
-        )
+        return {
+            "viton": self.gpu_free_mb_viton,
+            "ai_model": self.gpu_free_mb_ai_model,
+        }.get(job_type, self.gpu_free_mb_ai_human)
 
     def timeout_base_for(self, job_type: str) -> int:
-        return self.timeout_viton if job_type == "viton" else self.timeout_ai_human
+        return {
+            "viton": self.timeout_viton,
+            "ai_model": self.timeout_ai_model,
+        }.get(job_type, self.timeout_ai_human)
 
     def per_image_s_for(self, job_type: str) -> float:
-        return (
-            self.stage_per_image_s_viton
-            if job_type == "viton"
-            else self.stage_per_image_s_ai_human
-        )
+        return {
+            "viton": self.stage_per_image_s_viton,
+            "ai_model": self.stage_per_image_s_ai_model,
+        }.get(job_type, self.stage_per_image_s_ai_human)
 
     def conda_subprocess_env(
         self, extra: dict[str, str] | None = None
@@ -172,8 +202,13 @@ class Settings(BaseSettings):
         # the .env / compose already carry the VT_ values).
         env["VT_QWEN_MODEL_DIR"] = str(self.qwen_model_dir)
         env["VT_ACCESSORY_LORA_PATH"] = str(self.accessory_lora_path)
+        env["VT_ACCESSORY_SCRIPT"] = str(self.accessory_script)
+        env["VT_ACCESSORY_MODE"] = self.accessory_mode
         env["VT_CONDA_ENV"] = self.conda_env
+        env["VT_AIMODEL_ENV"] = self.aimodel_env
+        env["VT_AI_MODEL_MAX_RETRIES"] = str(self.ai_model_max_retries)
         env["VT_AI_HUMAN_DIR"] = str(self.ai_human_dir)
+        env["VT_AI_MODEL_DIR"] = str(self.ai_model_dir)
         env["VT_REFTON_DIR"] = str(self.refton_dir)
         env["VT_VOSR_DIR"] = str(self.vosr_dir)
         if extra:

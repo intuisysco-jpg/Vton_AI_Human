@@ -115,7 +115,7 @@ async def test_partial_subscription_failure_closes_session_and_retries(monkeypat
         allow_retry.set()
         await until(lambda: consumer.connected)
         assert connect.await_count == 2
-        assert len(recovered.consumer_channel.subscriptions) == 2
+        assert len(recovered.consumer_channel.subscriptions) == 3
         assert consumer.app.state.consumer_connected
     finally:
         allow_retry.set()
